@@ -19,7 +19,7 @@ if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
     endif()
 endif()
 
-option(SAP_DRIVE_BUILD_TESTS "Build sap_network tests" Off)
+option(SAP_NETWORK_BUILD_TESTS "Build sap_network tests" On)
 
 add_subdirectory(sap_core)
 
@@ -44,7 +44,7 @@ elseif(MSVC)
     target_compile_options(sap_network_lib PRIVATE /W4)
 endif()
 
-if(SAP_DRIVE_BUILD_TESTS)
+if(SAP_NETWORK_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
