@@ -25,6 +25,8 @@ add_subdirectory(sap_core)
 
 add_library(sap_network_lib STATIC
     src/platform.cpp
+    src/tcp_socket.cpp
+    src/udp_socket.cpp
 )
 add_library(sap::network_lib ALIAS sap_network_lib)
 
