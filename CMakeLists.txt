@@ -28,7 +28,7 @@ add_library(sap_network_lib STATIC
     src/tcp_socket.cpp
     src/udp_socket.cpp
 )
-add_library(sap::network_lib ALIAS sap_network_lib)
+add_library(sap::network ALIAS sap_network_lib)
 
 target_include_directories(sap_network_lib
     PUBLIC
