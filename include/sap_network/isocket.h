@@ -2,6 +2,8 @@
 #include "sap_core/types.h"
 #include "sap_network/types.h"
 
+#include <sap_core/stl/unique_ptr.h>
+
 class ISocket {
 public:
     virtual ~ISocket() = default;
