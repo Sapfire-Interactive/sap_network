@@ -18,6 +18,7 @@ namespace sap::network {
         size_t recv(stl::span<std::byte> data) override;
         void close() override;
         bool valid() const override;
+        inline const SocketConfig& config() const override { return m_config; }
 
     private:
         explicit TCPSocket(SocketHandle handle);
