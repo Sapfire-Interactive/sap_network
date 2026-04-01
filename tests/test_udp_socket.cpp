@@ -123,7 +123,7 @@ TEST_F(UDPSocketTest, ConnectToInvalidHostnameFails) {
 TEST_F(UDPSocketTest, SendRecvRoundTrip) {
     const std::string payload = "Hello, UDP!";
 
-    UDPSocket receiver({.port = UDP_PORT_RX});
+    UDPSocket receiver({.port = UDP_PORT_RX, .reuse_addr = true});
     ASSERT_TRUE(receiver.bind());
 
     UDPSocket sender({.host = "127.0.0.1", .port = UDP_PORT_RX});
@@ -153,8 +153,8 @@ TEST_F(UDPSocketTest, BidirectionalExchange) {
     const std::string ping = "ping";
     const std::string pong = "pong";
 
-    UDPSocket rx_a({.port = UDP_PORT_BIDIR_A});
-    UDPSocket rx_b({.port = UDP_PORT_BIDIR_B});
+    UDPSocket rx_a({.port = UDP_PORT_BIDIR_A, .reuse_addr = true});
+    UDPSocket rx_b({.port = UDP_PORT_BIDIR_B, .reuse_addr = true});
     ASSERT_TRUE(rx_a.bind());
     ASSERT_TRUE(rx_b.bind());
 
@@ -185,7 +185,7 @@ TEST_F(UDPSocketTest, BidirectionalExchange) {
 TEST_F(UDPSocketTest, ThreadedSendRecv) {
     const std::string payload = "threaded-udp";
 
-    UDPSocket receiver({.port = UDP_PORT_THREAD});
+    UDPSocket receiver({.port = UDP_PORT_THREAD, .reuse_addr = true});
     ASSERT_TRUE(receiver.bind());
 
     std::promise<std::string> result_promise;
@@ -212,7 +212,7 @@ TEST_F(UDPSocketTest, ThreadedSendRecv) {
 TEST_F(UDPSocketTest, MultipleDatagramsInSequence) {
     const std::vector<std::string> messages = {"one", "two", "three", "four", "five"};
 
-    UDPSocket receiver({.port = UDP_PORT_MULTI});
+    UDPSocket receiver({.port = UDP_PORT_MULTI, .reuse_addr = true});
     ASSERT_TRUE(receiver.bind());
 
     UDPSocket sender({.host = "127.0.0.1", .port = UDP_PORT_MULTI});
@@ -238,7 +238,7 @@ TEST_F(UDPSocketTest, LargeDatagramTransfer) {
     for (size_t i = 0; i < DATA_SIZE; ++i)
         send_data[i] = static_cast<std::byte>(i & 0xFF);
 
-    UDPSocket receiver({.port = UDP_PORT_LARGE});
+    UDPSocket receiver({.port = UDP_PORT_LARGE, .reuse_addr = true});
     ASSERT_TRUE(receiver.bind());
 
     UDPSocket sender({.host = "127.0.0.1", .port = UDP_PORT_LARGE});
@@ -250,6 +250,24 @@ TEST_F(UDPSocketTest, LargeDatagramTransfer) {
     size_t received = receiver.recv(recv_buf);
     ASSERT_EQ(received, DATA_SIZE);
     EXPECT_EQ(recv_buf, send_data);
+}
+
+// ---------------------------------------------------------------------------
+// SO_REUSEADDR
+// ---------------------------------------------------------------------------
+
+TEST_F(UDPSocketTest, ReuseAddrAllowsRebindAfterClose) {
+    {
+        UDPSocket first({.port = UDP_PORT_BIND_A, .reuse_addr = true});
+        ASSERT_TRUE(first.bind());
+    }
+    UDPSocket second({.port = UDP_PORT_BIND_A, .reuse_addr = true});
+    EXPECT_TRUE(second.bind());
+}
+
+TEST_F(UDPSocketTest, ReuseAddrDefaultsToFalse) {
+    SocketConfig cfg{.port = UDP_PORT_BIND_A};
+    EXPECT_FALSE(cfg.reuse_addr);
 }
 
 // ---------------------------------------------------------------------------

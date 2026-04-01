@@ -19,6 +19,12 @@ TCPSocket::TCPSocket(SocketHandle handle)
 TCPSocket::~TCPSocket() { close(); }
 
 bool TCPSocket::bind() {
+    if (m_config.reuse_addr) {
+        int opt = 1;
+        ::setsockopt(m_handle, SOL_SOCKET, SO_REUSEADDR,
+                     reinterpret_cast<const char*>(&opt), sizeof(opt));
+    }
+
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;

@@ -82,13 +82,13 @@ TEST_F(TCPSocketTest, BindToPortZeroSucceeds) {
 // ---------------------------------------------------------------------------
 
 TEST_F(TCPSocketTest, ListenAfterBindSucceeds) {
-    TCPSocket sock({.port = TCP_PORT_LISTEN});
+    TCPSocket sock({.port = TCP_PORT_LISTEN, .reuse_addr = true});
     ASSERT_TRUE(sock.bind());
     EXPECT_TRUE(sock.listen());
 }
 
 TEST_F(TCPSocketTest, ListenWithCustomBacklog) {
-    TCPSocket sock({.port = TCP_PORT_LISTEN, .listen_backlog = 5});
+    TCPSocket sock({.port = TCP_PORT_LISTEN, .listen_backlog = 5, .reuse_addr = true});
     ASSERT_TRUE(sock.bind());
     EXPECT_TRUE(sock.listen());
 }
@@ -131,7 +131,7 @@ TEST_F(TCPSocketTest, AcceptOnNonListeningSocketReturnsNull) {
 TEST_F(TCPSocketTest, EchoRoundTrip) {
     const std::string payload = "Hello, TCP!";
 
-    TCPSocket server({.port = TCP_PORT_ECHO, .listen_backlog = 1});
+    TCPSocket server({.port = TCP_PORT_ECHO, .listen_backlog = 1, .reuse_addr = true});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -174,7 +174,7 @@ TEST_F(TCPSocketTest, EchoRoundTrip) {
 TEST_F(TCPSocketTest, MultipleSequentialClients) {
     const std::vector<std::string> messages = {"first", "second", "third"};
 
-    TCPSocket server({.port = TCP_PORT_MULTI, .listen_backlog = 10});
+    TCPSocket server({.port = TCP_PORT_MULTI, .listen_backlog = 10, .reuse_addr = true});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -217,7 +217,7 @@ TEST_F(TCPSocketTest, LargePayloadTransfer) {
     for (size_t i = 0; i < DATA_SIZE; ++i)
         send_data[i] = static_cast<std::byte>(i & 0xFF);
 
-    TCPSocket server({.port = TCP_PORT_LARGE, .listen_backlog = 1});
+    TCPSocket server({.port = TCP_PORT_LARGE, .listen_backlog = 1, .reuse_addr = true});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -277,8 +277,34 @@ TEST_F(TCPSocketTest, RecvOnClosedSocketReturnsZero) {
 // Accepted socket lifecycle
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// SO_REUSEADDR
+// ---------------------------------------------------------------------------
+
+TEST_F(TCPSocketTest, ReuseAddrAllowsRebindAfterClose) {
+    // Without reuse_addr, a recently-closed server socket leaves the port
+    // in TIME_WAIT and a second bind would fail. With reuse_addr, it succeeds.
+    {
+        TCPSocket first({.port = TCP_PORT_CLOSE_SEND, .reuse_addr = true});
+        ASSERT_TRUE(first.bind());
+        ASSERT_TRUE(first.listen());
+        // first goes out of scope, socket closes
+    }
+    TCPSocket second({.port = TCP_PORT_CLOSE_SEND, .reuse_addr = true});
+    EXPECT_TRUE(second.bind());
+}
+
+TEST_F(TCPSocketTest, ReuseAddrDefaultsToFalse) {
+    SocketConfig cfg{.port = TCP_PORT_BIND};
+    EXPECT_FALSE(cfg.reuse_addr);
+}
+
+// ---------------------------------------------------------------------------
+// Accepted socket lifecycle
+// ---------------------------------------------------------------------------
+
 TEST_F(TCPSocketTest, AcceptedSocketIsValid) {
-    TCPSocket server({.port = TCP_PORT_CLOSE_SEND, .listen_backlog = 1});
+    TCPSocket server({.port = TCP_PORT_CLOSE_SEND, .listen_backlog = 1, .reuse_addr = true});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
