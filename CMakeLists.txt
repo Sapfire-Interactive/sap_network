@@ -21,7 +21,9 @@ endif()
 
 option(SAP_NETWORK_BUILD_TESTS "Build sap_network tests" On)
 
-add_subdirectory(sap_core)
+if(NOT TARGET sap::core)
+    add_subdirectory(sap_core)
+endif()
 
 add_library(sap_network_lib STATIC
     src/platform.cpp
@@ -39,6 +41,7 @@ target_include_directories(sap_network_lib
 )
 
 target_compile_features(sap_network_lib PUBLIC cxx_std_20)
+set_target_properties(sap_network_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(sap_network_lib PRIVATE -Wall -Wextra -Wpedantic)
