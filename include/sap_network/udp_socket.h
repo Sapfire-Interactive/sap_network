@@ -17,6 +17,9 @@ namespace sap::network {
         size_t send(stl::span<const std::byte> data) override;
         size_t recv(stl::span<std::byte> data) override;
         void close() override;
+
+        void set_recv_timeout(std::chrono::milliseconds ms);
+        void set_send_timeout(std::chrono::milliseconds ms);
         bool valid() const override;
         const SocketConfig& config() const override { return m_config; }
 

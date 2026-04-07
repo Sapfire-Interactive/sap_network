@@ -20,6 +20,9 @@ namespace sap::network {
         bool valid() const override;
         inline const SocketConfig& config() const override { return m_config; }
 
+        void set_recv_timeout(std::chrono::milliseconds ms);
+        void set_send_timeout(std::chrono::milliseconds ms);
+
     private:
         explicit TCPSocket(SocketHandle handle);
         bool connect_with_timeout(const sockaddr* addr, socklen_t len) const;

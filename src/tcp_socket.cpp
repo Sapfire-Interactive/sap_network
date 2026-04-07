@@ -25,11 +25,44 @@ bool TCPSocket::bind() {
                      reinterpret_cast<const char*>(&opt), sizeof(opt));
     }
 
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(m_config.port);
-    return ::bind(m_handle, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+    if (m_config.host.empty()) {
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port        = htons(m_config.port);
+        return ::bind(m_handle, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+    }
+
+    std::string port_str = std::to_string(m_config.port);
+    addrinfo hints{};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags    = AI_PASSIVE;
+
+    addrinfo* res = nullptr;
+    if (::getaddrinfo(m_config.host.c_str(), port_str.c_str(), &hints, &res) != 0)
+        return false;
+    bool ok = ::bind(m_handle, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen)) == 0;
+    ::freeaddrinfo(res);
+    return ok;
+}
+
+void TCPSocket::set_recv_timeout(std::chrono::milliseconds ms) {
+    auto count = ms.count();
+    timeval tv{};
+    tv.tv_sec  = static_cast<long>(count / 1000);
+    tv.tv_usec = static_cast<long>((count % 1000) * 1000);
+    ::setsockopt(m_handle, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&tv), sizeof(tv));
+}
+
+void TCPSocket::set_send_timeout(std::chrono::milliseconds ms) {
+    auto count = ms.count();
+    timeval tv{};
+    tv.tv_sec  = static_cast<long>(count / 1000);
+    tv.tv_usec = static_cast<long>((count % 1000) * 1000);
+    ::setsockopt(m_handle, SOL_SOCKET, SO_SNDTIMEO,
+                 reinterpret_cast<const char*>(&tv), sizeof(tv));
 }
 
 bool TCPSocket::listen() {
@@ -119,7 +152,13 @@ stl::unique_ptr<ISocket> TCPSocket::accept() {
     SocketHandle client = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
     if (client == INVALID_SOCKET_HANDLE)
         return nullptr;
-    return stl::unique_ptr<ISocket>(new TCPSocket(client));
+    auto sock = stl::unique_ptr<TCPSocket>(new TCPSocket(client));
+    sock->m_config = m_config;
+    if (m_config.recv_timeout.count() > 0)
+        sock->set_recv_timeout(m_config.recv_timeout);
+    if (m_config.send_timeout.count() > 0)
+        sock->set_send_timeout(m_config.send_timeout);
+    return sock;
 }
 
 size_t TCPSocket::send(stl::span<const std::byte> data) {
@@ -138,9 +177,14 @@ size_t TCPSocket::recv(stl::span<std::byte> data) {
 
 void TCPSocket::close() {
     if (m_handle == INVALID_SOCKET_HANDLE) return;
+    // shutdown() before close() so any thread blocked in accept()/recv() on this
+    // fd is woken immediately. close() alone leaves blocked syscalls hanging
+    // because the kernel keeps the descriptor alive while a syscall holds a ref.
 #ifdef _WIN32
+    ::shutdown(m_handle, SD_BOTH);
     ::closesocket(m_handle);
 #else
+    ::shutdown(m_handle, SHUT_RDWR);
     ::close(m_handle);
 #endif
     m_handle = INVALID_SOCKET_HANDLE;
