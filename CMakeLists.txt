@@ -4,21 +4,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_EXPORT_COMPILE_COMMANDS True)
 project(sap_network VERSION 0.1)
 
-find_package(Git QUIET)
-if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
-    # Update submodules as needed
-    option(GIT_SUBMODULE "Check submodules during build" ON)
-    if(GIT_SUBMODULE)
-        message(STATUS "Submodule update")
-        execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
-                        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                        RESULT_VARIABLE GIT_SUBMOD_RESULT)
-        if(NOT GIT_SUBMOD_RESULT EQUAL "0")
-            message(FATAL_ERROR "git submodule update --init --recursive failed with ${GIT_SUBMOD_RESULT}, please checkout submodules")
-        endif()
-    endif()
-endif()
-
 option(SAP_NETWORK_BUILD_TESTS "Build sap_network tests" On)
 
 if(NOT TARGET sap::core)
@@ -55,5 +40,12 @@ if(SAP_NETWORK_BUILD_TESTS)
 endif()
 
 install(TARGETS sap_network_lib
+    EXPORT sap_network_targets
     RUNTIME DESTINATION bin
+)
+
+install(EXPORT sap_network_targets
+    FILE sap_network_targets.cmake
+    NAMESPACE sap::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/sap_network
 )
