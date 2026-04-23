@@ -1,5 +1,9 @@
 #include "sap_network/platform.h"
 
+#ifdef _WIN32
+    #include <winsock2.h>
+#endif
+
 namespace sap::network {
     void SocketPlatform::init() { static SocketPlatform platform; }
 
