@@ -1,6 +1,7 @@
 #pragma once
 #include "sap_network/platform.h"
 #include "sap_network/socket_config.h"
+#include "sap_network/socket_concept.h"
 
 #include <sap_core/stl/result.h>
 
@@ -30,5 +31,7 @@ namespace sap::network {
         SocketHandle m_handle{INVALID_SOCKET_HANDLE};
         SocketConfig m_config;
     };
+
+    static_assert(Socket<UDPSocket>);
 
 } // namespace sap::network
