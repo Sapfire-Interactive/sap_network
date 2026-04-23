@@ -30,7 +30,6 @@ namespace sap::network {
 
     private:
         explicit TCPSocket(SocketHandle handle);
-        bool connect_with_timeout(const sockaddr* addr, socklen_t len) const;
 
         SocketHandle m_handle{INVALID_SOCKET_HANDLE};
         SocketConfig m_config;

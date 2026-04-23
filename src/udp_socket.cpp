@@ -1,28 +1,36 @@
 #include "sap_network/udp_socket.h"
 
-#include <winsock2.h>
+#include "socket_internal.h"
+
+#include <string>
+#include <utility>
 
 namespace sap::network {
 
+    using internal::apply_recv_timeout;
+    using internal::apply_send_timeout;
+    using internal::close_handle;
+    using internal::error_message;
+    using internal::last_error;
+
     UDPSocket::UDPSocket(SocketConfig config) : m_handle(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)), m_config(std::move(config)) {}
 
-    UDPSocket::UDPSocket(UDPSocket&& other) noexcept : m_handle(std::move(other.m_handle)), m_config(std::move(other.m_config)) {
+    UDPSocket::UDPSocket(UDPSocket&& other) noexcept : m_handle(other.m_handle), m_config(std::move(other.m_config)) {
         other.m_handle = INVALID_SOCKET_HANDLE;
     }
 
     UDPSocket& UDPSocket::operator=(UDPSocket&& other) noexcept {
+        if (this == &other)
+            return *this;
         if (m_handle != INVALID_SOCKET_HANDLE)
             close();
-        m_handle = std::move(other.m_handle);
+        m_handle = other.m_handle;
         other.m_handle = INVALID_SOCKET_HANDLE;
         m_config = std::move(other.m_config);
         return *this;
     }
 
-    UDPSocket::~UDPSocket() {
-        if (m_handle != INVALID_SOCKET_HANDLE)
-            close();
-    }
+    UDPSocket::~UDPSocket() { close(); }
 
     bool UDPSocket::bind() {
         if (m_config.reuse_addr) {
@@ -49,22 +57,6 @@ namespace sap::network {
         return ok;
     }
 
-    void UDPSocket::set_recv_timeout(std::chrono::milliseconds ms) {
-        auto count = ms.count();
-        timeval tv{};
-        tv.tv_sec = static_cast<long>(count / 1000);
-        tv.tv_usec = static_cast<long>((count % 1000) * 1000);
-        ::setsockopt(m_handle, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-    }
-
-    void UDPSocket::set_send_timeout(std::chrono::milliseconds ms) {
-        auto count = ms.count();
-        timeval tv{};
-        tv.tv_sec = static_cast<long>(count / 1000);
-        tv.tv_usec = static_cast<long>((count % 1000) * 1000);
-        ::setsockopt(m_handle, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-    }
-
     bool UDPSocket::connect() {
         std::string port_str = std::to_string(m_config.port);
         addrinfo hints{};
@@ -78,24 +70,30 @@ namespace sap::network {
         return ok;
     }
 
-    size_t UDPSocket::send(stl::span<const std::byte> data) {
+    stl::result<size_t> UDPSocket::send(stl::span<const stl::byte> data) {
         auto result = ::send(m_handle, reinterpret_cast<const char*>(data.data()), static_cast<int>(data.size()), 0);
-        return result < 0 ? 0 : static_cast<size_t>(result);
+        if (result < 0)
+            return stl::make_error<size_t>("UDP send failed: {}", error_message(last_error()));
+        return static_cast<size_t>(result);
     }
 
-    size_t UDPSocket::recv(stl::span<std::byte> data) {
+    stl::result<size_t> UDPSocket::recv(stl::span<stl::byte> data) {
         auto result = ::recv(m_handle, reinterpret_cast<char*>(data.data()), static_cast<int>(data.size()), 0);
-        return result < 0 ? 0 : static_cast<size_t>(result);
+        if (result < 0)
+            return stl::make_error<size_t>("UDP recv failed: {}", error_message(last_error()));
+        return static_cast<size_t>(result);
     }
 
     void UDPSocket::close() {
         if (m_handle == INVALID_SOCKET_HANDLE)
             return;
-        ::shutdown(m_handle, SD_BOTH);
-        ::closesocket(m_handle);
+        close_handle(m_handle);
         m_handle = INVALID_SOCKET_HANDLE;
     }
 
     bool UDPSocket::valid() const { return m_handle != INVALID_SOCKET_HANDLE; }
+
+    void UDPSocket::set_recv_timeout(std::chrono::milliseconds ms) { apply_recv_timeout(m_handle, ms); }
+    void UDPSocket::set_send_timeout(std::chrono::milliseconds ms) { apply_send_timeout(m_handle, ms); }
 
 } // namespace sap::network

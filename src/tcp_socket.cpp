@@ -1,31 +1,58 @@
 #include "sap_network/tcp_socket.h"
 
+#include "socket_internal.h"
+
 #include <string>
-#include <winsock2.h>
+#include <utility>
 
 namespace sap::network {
+
+    using internal::apply_recv_timeout;
+    using internal::apply_send_timeout;
+    using internal::close_handle;
+    using internal::error_message;
+    using internal::last_error;
+    using internal::set_nonblocking;
+    using internal::wait_writable;
+    using internal::would_block;
+
+    namespace {
+
+        bool connect_blocking(SocketHandle h, const sockaddr* addr, socklen_t len) {
+            return ::connect(h, addr, len) == 0;
+        }
+
+        bool connect_with_timeout(SocketHandle h, const sockaddr* addr, socklen_t len, std::chrono::milliseconds timeout) {
+            set_nonblocking(h, true);
+            bool connected = (::connect(h, addr, len) == 0);
+            if (!connected && would_block(last_error()))
+                connected = wait_writable(h, static_cast<long>(timeout.count()));
+            set_nonblocking(h, false);
+            return connected;
+        }
+
+    } // namespace
 
     TCPSocket::TCPSocket(SocketConfig config) : m_handle(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), m_config(std::move(config)) {}
 
     TCPSocket::TCPSocket(SocketHandle handle) : m_handle(handle) {}
 
-    TCPSocket::TCPSocket(TCPSocket&& other) noexcept : m_handle(std::move(other.m_handle)), m_config(std::move(other.m_config)) {
+    TCPSocket::TCPSocket(TCPSocket&& other) noexcept : m_handle(other.m_handle), m_config(std::move(other.m_config)) {
         other.m_handle = INVALID_SOCKET_HANDLE;
     }
 
     TCPSocket& TCPSocket::operator=(TCPSocket&& other) noexcept {
+        if (this == &other)
+            return *this;
         if (m_handle != INVALID_SOCKET_HANDLE)
             close();
-        m_handle = std::move(other.m_handle);
+        m_handle = other.m_handle;
         other.m_handle = INVALID_SOCKET_HANDLE;
         m_config = std::move(other.m_config);
         return *this;
     }
 
-    TCPSocket::~TCPSocket() {
-        if (m_handle != INVALID_SOCKET_HANDLE)
-            close();
-    }
+    TCPSocket::~TCPSocket() { close(); }
 
     bool TCPSocket::bind() {
         if (m_config.reuse_addr) {
@@ -55,22 +82,6 @@ namespace sap::network {
         return ok;
     }
 
-    void TCPSocket::set_recv_timeout(std::chrono::milliseconds ms) {
-        auto count = ms.count();
-        timeval tv{};
-        tv.tv_sec = static_cast<long>(count / 1000);
-        tv.tv_usec = static_cast<long>((count % 1000) * 1000);
-        ::setsockopt(m_handle, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-    }
-
-    void TCPSocket::set_send_timeout(std::chrono::milliseconds ms) {
-        auto count = ms.count();
-        timeval tv{};
-        tv.tv_sec = static_cast<long>(count / 1000);
-        tv.tv_usec = static_cast<long>((count % 1000) * 1000);
-        ::setsockopt(m_handle, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-    }
-
     bool TCPSocket::listen() { return ::listen(m_handle, m_config.listen_backlog) == 0; }
 
     bool TCPSocket::connect() {
@@ -81,45 +92,11 @@ namespace sap::network {
         addrinfo* res = nullptr;
         if (::getaddrinfo(m_config.host.c_str(), port_str.c_str(), &hints, &res) != 0)
             return false;
-        bool ok;
-        if (m_config.connect_timeout.count() > 0)
-            ok = connect_with_timeout(res->ai_addr, static_cast<socklen_t>(res->ai_addrlen));
-        else
-            ok = ::connect(m_handle, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen)) == 0;
+        bool ok = m_config.connect_timeout.count() > 0
+                      ? connect_with_timeout(m_handle, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen), m_config.connect_timeout)
+                      : connect_blocking(m_handle, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen));
         ::freeaddrinfo(res);
         return ok;
-    }
-
-    bool TCPSocket::connect_with_timeout(const sockaddr* addr, socklen_t len) const {
-        // Switch to non-blocking mode.
-        u_long nb = 1;
-        ::ioctlsocket(m_handle, FIONBIO, &nb);
-        bool connected = false;
-        if (::connect(m_handle, addr, len) == 0) {
-            connected = true;
-        } else {
-            bool in_progress = (WSAGetLastError() == WSAEWOULDBLOCK);
-            if (in_progress) {
-                auto ms = m_config.connect_timeout.count();
-                timeval tv{};
-                tv.tv_sec = static_cast<long>(ms / 1000);
-                tv.tv_usec = static_cast<long>((ms % 1000) * 1000);
-                fd_set write_fds;
-                FD_ZERO(&write_fds);
-                FD_SET(m_handle, &write_fds);
-                int nfds = 0; // ignored on Windows
-                if (::select(nfds, nullptr, &write_fds, nullptr, &tv) == 1) {
-                    int err = 0;
-                    socklen_t err_len = sizeof(err);
-                    ::getsockopt(m_handle, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &err_len);
-                    connected = (err == 0);
-                }
-            }
-        }
-        // Restore blocking mode.
-        u_long bl = 0;
-        ::ioctlsocket(m_handle, FIONBIO, &bl);
-        return connected;
     }
 
     stl::result<TCPSocket> TCPSocket::accept() {
@@ -127,7 +104,7 @@ namespace sap::network {
         socklen_t len = sizeof(addr);
         SocketHandle client = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
         if (client == INVALID_SOCKET_HANDLE)
-            return stl::make_error<TCPSocket>("Failed to accept TCP socket: {}", WSAGetLastError());
+            return stl::make_error<TCPSocket>("Failed to accept TCP socket: {}", error_message(last_error()));
         TCPSocket sock{client};
         sock.m_config = m_config;
         if (m_config.recv_timeout.count() > 0)
@@ -137,14 +114,18 @@ namespace sap::network {
         return sock;
     }
 
-    size_t TCPSocket::send(stl::span<const std::byte> data) {
+    stl::result<size_t> TCPSocket::send(stl::span<const stl::byte> data) {
         auto result = ::send(m_handle, reinterpret_cast<const char*>(data.data()), static_cast<int>(data.size()), 0);
-        return result < 0 ? 0 : static_cast<size_t>(result);
+        if (result < 0)
+            return stl::make_error<size_t>("TCP send failed: {}", error_message(last_error()));
+        return static_cast<size_t>(result);
     }
 
-    size_t TCPSocket::recv(stl::span<std::byte> data) {
+    stl::result<size_t> TCPSocket::recv(stl::span<stl::byte> data) {
         auto result = ::recv(m_handle, reinterpret_cast<char*>(data.data()), static_cast<int>(data.size()), 0);
-        return result < 0 ? 0 : static_cast<size_t>(result);
+        if (result < 0)
+            return stl::make_error<size_t>("TCP recv failed: {}", error_message(last_error()));
+        return static_cast<size_t>(result);
     }
 
     void TCPSocket::close() {
@@ -153,11 +134,13 @@ namespace sap::network {
         // shutdown() before close() so any thread blocked in accept()/recv() on this
         // fd is woken immediately. close() alone leaves blocked syscalls hanging
         // because the kernel keeps the descriptor alive while a syscall holds a ref.
-        ::shutdown(m_handle, SD_BOTH);
-        ::closesocket(m_handle);
+        close_handle(m_handle);
         m_handle = INVALID_SOCKET_HANDLE;
     }
 
     bool TCPSocket::valid() const { return m_handle != INVALID_SOCKET_HANDLE; }
+
+    void TCPSocket::set_recv_timeout(std::chrono::milliseconds ms) { apply_recv_timeout(m_handle, ms); }
+    void TCPSocket::set_send_timeout(std::chrono::milliseconds ms) { apply_send_timeout(m_handle, ms); }
 
 } // namespace sap::network
