@@ -127,11 +127,11 @@ namespace sap::network {
         if (client == INVALID_SOCKET_HANDLE)
             return stl::make_error<TCPSocket>("Failed to accept TCP socket: {}", WSAGetLastError());
         TCPSocket sock{client};
-        sock->m_config = m_config;
+        sock.m_config = m_config;
         if (m_config.recv_timeout.count() > 0)
-            sock->set_recv_timeout(m_config.recv_timeout);
+            sock.set_recv_timeout(m_config.recv_timeout);
         if (m_config.send_timeout.count() > 0)
-            sock->set_send_timeout(m_config.send_timeout);
+            sock.set_send_timeout(m_config.send_timeout);
         return sock;
     }
 
