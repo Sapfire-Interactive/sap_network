@@ -22,10 +22,7 @@ namespace sap::network {
         return *this;
     }
 
-    TCPSocket::~TCPSocket() {
-        if (m_handle != INVALID_SOCKET_HANDLE)
-            close();
-    }
+    TCPSocket::~TCPSocket() { close(); }
 
     bool TCPSocket::bind() {
         if (m_config.reuse_addr) {
@@ -126,8 +123,8 @@ namespace sap::network {
         socklen_t len = sizeof(addr);
         SocketHandle client = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
         if (client == INVALID_SOCKET_HANDLE)
-            return stl::make_error<TCPSocket>("Failed to accept TCP socket");
-        TCPSocket sock = TCPSocket{client};
+            return stl::make_error<TCPSocket>("Failed to accept TCP socket: {}", ::strerror(errno));
+        TCPSocket sock{client};
         sock.m_config = m_config;
         if (m_config.recv_timeout.count() > 0)
             sock.set_recv_timeout(m_config.recv_timeout);
