@@ -24,10 +24,10 @@ namespace sap::network {
         void set_recv_timeout(std::chrono::milliseconds ms);
         void set_send_timeout(std::chrono::milliseconds ms);
         bool valid() const;
-        const SocketConfig& config() const { return m_config; }
+        inline const SocketConfig& config() const { return m_config; }
 
     private:
-        SocketHandle m_handle;
+        SocketHandle m_handle{INVALID_SOCKET_HANDLE};
         SocketConfig m_config;
     };
 
