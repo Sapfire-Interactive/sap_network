@@ -11,6 +11,8 @@ namespace sap::network {
     }
 
     UDPSocket& UDPSocket::operator=(UDPSocket&& other) noexcept {
+        if (m_handle != INVALID_SOCKET_HANDLE)
+            close();
         m_handle = std::move(other.m_handle);
         other.m_handle = INVALID_SOCKET_HANDLE;
         m_config = std::move(other.m_config);

@@ -14,6 +14,8 @@ namespace sap::network {
     }
 
     TCPSocket& TCPSocket::operator=(TCPSocket&& other) noexcept {
+        if (m_handle != INVALID_SOCKET_HANDLE)
+            close();
         m_handle = std::move(other.m_handle);
         other.m_handle = INVALID_SOCKET_HANDLE;
         m_config = std::move(other.m_config);
