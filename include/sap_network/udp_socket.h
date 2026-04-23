@@ -17,8 +17,8 @@ namespace sap::network {
 
         bool bind();
         bool connect();
-        size_t send(stl::span<const std::byte> data);
-        size_t recv(stl::span<std::byte> data);
+        stl::result<size_t> send(stl::span<const stl::byte> data);
+        stl::result<size_t> recv(stl::span<stl::byte> data);
         void close();
 
         void set_recv_timeout(std::chrono::milliseconds ms);

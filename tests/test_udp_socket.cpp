@@ -112,12 +112,15 @@ TEST_F(UDPSocketTest, SendRecvRoundTrip) {
     ASSERT_TRUE(sender.connect());
 
     auto sbuf = to_bytes(payload);
-    EXPECT_EQ(sender.send(sbuf), payload.size());
+    auto sent = sender.send(sbuf);
+    ASSERT_TRUE(sent);
+    EXPECT_EQ(sent.value(), payload.size());
 
     std::vector<std::byte> rbuf(256);
-    size_t n = receiver.recv(rbuf);
-    ASSERT_EQ(n, payload.size());
-    EXPECT_EQ(from_bytes(rbuf, n), payload);
+    auto r = receiver.recv(rbuf);
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r.value(), payload.size());
+    EXPECT_EQ(from_bytes(rbuf, r.value()), payload);
 }
 
 // ---------------------------------------------------------------------------
@@ -135,20 +138,26 @@ TEST_F(UDPSocketTest, BidirectionalExchange) {
 
     UDPSocket tx_ab({.host = "127.0.0.1", .port = UDP_PORT_BIDIR_B});
     ASSERT_TRUE(tx_ab.connect());
-    EXPECT_EQ(tx_ab.send(to_bytes(ping)), ping.size());
+    auto sent_ab = tx_ab.send(to_bytes(ping));
+    ASSERT_TRUE(sent_ab);
+    EXPECT_EQ(sent_ab.value(), ping.size());
 
     std::vector<std::byte> rbuf(256);
-    size_t n = rx_b.recv(rbuf);
-    ASSERT_EQ(n, ping.size());
-    EXPECT_EQ(from_bytes(rbuf, n), ping);
+    auto rb = rx_b.recv(rbuf);
+    ASSERT_TRUE(rb);
+    ASSERT_EQ(rb.value(), ping.size());
+    EXPECT_EQ(from_bytes(rbuf, rb.value()), ping);
 
     UDPSocket tx_ba({.host = "127.0.0.1", .port = UDP_PORT_BIDIR_A});
     ASSERT_TRUE(tx_ba.connect());
-    EXPECT_EQ(tx_ba.send(to_bytes(pong)), pong.size());
+    auto sent_ba = tx_ba.send(to_bytes(pong));
+    ASSERT_TRUE(sent_ba);
+    EXPECT_EQ(sent_ba.value(), pong.size());
 
-    n = rx_a.recv(rbuf);
-    ASSERT_EQ(n, pong.size());
-    EXPECT_EQ(from_bytes(rbuf, n), pong);
+    auto ra = rx_a.recv(rbuf);
+    ASSERT_TRUE(ra);
+    ASSERT_EQ(ra.value(), pong.size());
+    EXPECT_EQ(from_bytes(rbuf, ra.value()), pong);
 }
 
 // ---------------------------------------------------------------------------
@@ -164,15 +173,15 @@ TEST_F(UDPSocketTest, ThreadedSendRecv) {
     std::promise<std::string> result_promise;
     std::thread recv_thread([&] {
         std::vector<std::byte> buf(256);
-        size_t n = receiver.recv(buf);
-        result_promise.set_value(from_bytes(buf, n));
+        auto r = receiver.recv(buf);
+        result_promise.set_value(r ? from_bytes(buf, r.value()) : std::string{});
     });
 
     std::this_thread::sleep_for(10ms);
 
     UDPSocket sender({.host = "127.0.0.1", .port = UDP_PORT_THREAD});
     ASSERT_TRUE(sender.connect());
-    sender.send(to_bytes(payload));
+    ASSERT_TRUE(sender.send(to_bytes(payload)));
 
     recv_thread.join();
     EXPECT_EQ(result_promise.get_future().get(), payload);
@@ -192,12 +201,15 @@ TEST_F(UDPSocketTest, MultipleDatagramsInSequence) {
     ASSERT_TRUE(sender.connect());
 
     for (const auto& msg : messages) {
-        EXPECT_EQ(sender.send(to_bytes(msg)), msg.size());
+        auto sent = sender.send(to_bytes(msg));
+        ASSERT_TRUE(sent);
+        EXPECT_EQ(sent.value(), msg.size());
 
         std::vector<std::byte> rbuf(256);
-        size_t n = receiver.recv(rbuf);
-        ASSERT_EQ(n, msg.size());
-        EXPECT_EQ(from_bytes(rbuf, n), msg);
+        auto r = receiver.recv(rbuf);
+        ASSERT_TRUE(r);
+        ASSERT_EQ(r.value(), msg.size());
+        EXPECT_EQ(from_bytes(rbuf, r.value()), msg);
     }
 }
 
@@ -217,11 +229,14 @@ TEST_F(UDPSocketTest, LargeDatagramTransfer) {
     UDPSocket sender({.host = "127.0.0.1", .port = UDP_PORT_LARGE});
     ASSERT_TRUE(sender.connect());
 
-    ASSERT_EQ(sender.send(send_data), DATA_SIZE);
+    auto sent = sender.send(send_data);
+    ASSERT_TRUE(sent);
+    ASSERT_EQ(sent.value(), DATA_SIZE);
 
     std::vector<std::byte> recv_buf(DATA_SIZE);
-    size_t received = receiver.recv(recv_buf);
-    ASSERT_EQ(received, DATA_SIZE);
+    auto r = receiver.recv(recv_buf);
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r.value(), DATA_SIZE);
     EXPECT_EQ(recv_buf, send_data);
 }
 
@@ -247,16 +262,16 @@ TEST_F(UDPSocketTest, ReuseAddrDefaultsToFalse) {
 // Send / recv on closed socket
 // ---------------------------------------------------------------------------
 
-TEST_F(UDPSocketTest, SendOnClosedSocketReturnsZero) {
+TEST_F(UDPSocketTest, SendOnClosedSocketFails) {
     UDPSocket sock({.port = UDP_PORT_BIND_A});
     sock.close();
     std::vector<std::byte> buf = {std::byte{0xAB}, std::byte{0xCD}};
-    EXPECT_EQ(sock.send(buf), 0u);
+    EXPECT_FALSE(sock.send(buf));
 }
 
-TEST_F(UDPSocketTest, RecvOnClosedSocketReturnsZero) {
+TEST_F(UDPSocketTest, RecvOnClosedSocketFails) {
     UDPSocket sock({.port = UDP_PORT_BIND_A});
     sock.close();
     std::vector<std::byte> buf(16);
-    EXPECT_EQ(sock.recv(buf), 0u);
+    EXPECT_FALSE(sock.recv(buf));
 }

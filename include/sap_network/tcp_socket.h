@@ -19,8 +19,8 @@ namespace sap::network {
         bool listen();
         bool connect();
         stl::result<TCPSocket> accept();
-        size_t send(stl::span<const std::byte> data);
-        size_t recv(stl::span<std::byte> data);
+        stl::result<size_t> send(stl::span<const stl::byte> data);
+        stl::result<size_t> recv(stl::span<stl::byte> data);
         void close();
         bool valid() const;
         inline const SocketConfig& config() const { return m_config; }

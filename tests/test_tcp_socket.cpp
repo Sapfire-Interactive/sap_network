@@ -140,9 +140,9 @@ TEST_F(TCPSocketTest, EchoRoundTrip) {
         auto& client = result.value();
 
         std::vector<std::byte> buf(256);
-        size_t n = client.recv(buf);
-        if (n > 0)
-            client.send({buf.data(), n});
+        auto r = client.recv(buf);
+        if (r && r.value() > 0)
+            client.send({buf.data(), r.value()});
 
         server_ok.set_value(true);
     });
@@ -154,12 +154,15 @@ TEST_F(TCPSocketTest, EchoRoundTrip) {
 
     std::vector<std::byte> send_buf(payload.size());
     std::memcpy(send_buf.data(), payload.data(), payload.size());
-    EXPECT_EQ(client.send(send_buf), payload.size());
+    auto sent = client.send(send_buf);
+    ASSERT_TRUE(sent);
+    EXPECT_EQ(sent.value(), payload.size());
 
     std::vector<std::byte> recv_buf(256);
-    size_t received = client.recv(recv_buf);
-    ASSERT_EQ(received, payload.size());
-    EXPECT_EQ(std::string(reinterpret_cast<char*>(recv_buf.data()), received), payload);
+    auto received = client.recv(recv_buf);
+    ASSERT_TRUE(received);
+    ASSERT_EQ(received.value(), payload.size());
+    EXPECT_EQ(std::string(reinterpret_cast<char*>(recv_buf.data()), received.value()), payload);
 
     client.close();
     server_thread.join();
@@ -184,8 +187,8 @@ TEST_F(TCPSocketTest, MultipleSequentialClients) {
             auto& client = result.value();
 
             std::vector<std::byte> buf(256);
-            size_t n = client.recv(buf);
-            if (n > 0) client.send({buf.data(), n});
+            auto r = client.recv(buf);
+            if (r && r.value() > 0) client.send({buf.data(), r.value()});
         }
     });
 
@@ -197,11 +200,12 @@ TEST_F(TCPSocketTest, MultipleSequentialClients) {
 
         std::vector<std::byte> sbuf(msg.size());
         std::memcpy(sbuf.data(), msg.data(), msg.size());
-        client.send(sbuf);
+        ASSERT_TRUE(client.send(sbuf));
 
         std::vector<std::byte> rbuf(256);
-        size_t n = client.recv(rbuf);
-        EXPECT_EQ(std::string(reinterpret_cast<char*>(rbuf.data()), n), msg);
+        auto r = client.recv(rbuf);
+        ASSERT_TRUE(r);
+        EXPECT_EQ(std::string(reinterpret_cast<char*>(rbuf.data()), r.value()), msg);
         client.close();
     }
 
@@ -231,9 +235,9 @@ TEST_F(TCPSocketTest, LargePayloadTransfer) {
         std::vector<std::byte> accumulated;
         std::vector<std::byte> buf(4096);
         while (accumulated.size() < DATA_SIZE) {
-            size_t n = client.recv(buf);
-            if (n == 0) break;
-            accumulated.insert(accumulated.end(), buf.begin(), buf.begin() + n);
+            auto r = client.recv(buf);
+            if (!r || r.value() == 0) break;
+            accumulated.insert(accumulated.end(), buf.begin(), buf.begin() + r.value());
         }
         received_promise.set_value(std::move(accumulated));
     });
@@ -245,9 +249,10 @@ TEST_F(TCPSocketTest, LargePayloadTransfer) {
 
     size_t total_sent = 0;
     while (total_sent < DATA_SIZE) {
-        size_t n = client.send({send_data.data() + total_sent, DATA_SIZE - total_sent});
-        ASSERT_GT(n, 0u);
-        total_sent += n;
+        auto r = client.send({send_data.data() + total_sent, DATA_SIZE - total_sent});
+        ASSERT_TRUE(r);
+        ASSERT_GT(r.value(), 0u);
+        total_sent += r.value();
     }
     client.close();
 
@@ -261,18 +266,18 @@ TEST_F(TCPSocketTest, LargePayloadTransfer) {
 // Send / recv on closed socket
 // ---------------------------------------------------------------------------
 
-TEST_F(TCPSocketTest, SendOnClosedSocketReturnsZero) {
+TEST_F(TCPSocketTest, SendOnClosedSocketFails) {
     TCPSocket sock({.port = TCP_PORT_BIND});
     sock.close();
     std::vector<std::byte> buf = {std::byte{1}, std::byte{2}};
-    EXPECT_EQ(sock.send(buf), 0u);
+    EXPECT_FALSE(sock.send(buf));
 }
 
-TEST_F(TCPSocketTest, RecvOnClosedSocketReturnsZero) {
+TEST_F(TCPSocketTest, RecvOnClosedSocketFails) {
     TCPSocket sock({.port = TCP_PORT_BIND});
     sock.close();
     std::vector<std::byte> buf(16);
-    EXPECT_EQ(sock.recv(buf), 0u);
+    EXPECT_FALSE(sock.recv(buf));
 }
 
 // ---------------------------------------------------------------------------
