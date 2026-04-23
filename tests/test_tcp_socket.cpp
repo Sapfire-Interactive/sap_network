@@ -15,7 +15,6 @@
 using namespace sap::network;
 using namespace std::chrono_literals;
 
-// Ports reserved for these tests — picked to avoid common service ports.
 static constexpr u16 TCP_PORT_BIND        = 19100;
 static constexpr u16 TCP_PORT_LISTEN      = 19101;
 static constexpr u16 TCP_PORT_ECHO        = 19102;
@@ -98,7 +97,6 @@ TEST_F(TCPSocketTest, ListenWithCustomBacklog) {
 // ---------------------------------------------------------------------------
 
 TEST_F(TCPSocketTest, ConnectToClosedPortFails) {
-    // 127.0.0.1 on an unused port gives immediate ECONNREFUSED — no timeout needed.
     TCPSocket sock({.host = "127.0.0.1", .port = 19998});
     EXPECT_FALSE(sock.connect());
 }
@@ -116,12 +114,12 @@ TEST_F(TCPSocketTest, ConnectWithTimeoutFails) {
 }
 
 // ---------------------------------------------------------------------------
-// Accept — negative cases
+// Accept — negative case
 // ---------------------------------------------------------------------------
 
-TEST_F(TCPSocketTest, AcceptOnNonListeningSocketReturnsNull) {
+TEST_F(TCPSocketTest, AcceptOnNonListeningSocketFails) {
     TCPSocket sock({.port = TCP_PORT_BIND});
-    EXPECT_EQ(sock.accept(), nullptr);
+    EXPECT_FALSE(sock.accept());
 }
 
 // ---------------------------------------------------------------------------
@@ -137,13 +135,14 @@ TEST_F(TCPSocketTest, EchoRoundTrip) {
 
     std::promise<bool> server_ok;
     std::thread server_thread([&] {
-        auto client = server.accept();
-        if (!client) { server_ok.set_value(false); return; }
+        auto result = server.accept();
+        if (!result) { server_ok.set_value(false); return; }
+        auto& client = result.value();
 
         std::vector<std::byte> buf(256);
-        size_t n = client->recv(buf);
+        size_t n = client.recv(buf);
         if (n > 0)
-            client->send({buf.data(), n});
+            client.send({buf.data(), n});
 
         server_ok.set_value(true);
     });
@@ -180,11 +179,13 @@ TEST_F(TCPSocketTest, MultipleSequentialClients) {
 
     std::thread server_thread([&] {
         for (size_t i = 0; i < messages.size(); ++i) {
-            auto client = server.accept();
-            if (!client) continue;
+            auto result = server.accept();
+            if (!result) continue;
+            auto& client = result.value();
+
             std::vector<std::byte> buf(256);
-            size_t n = client->recv(buf);
-            if (n > 0) client->send({buf.data(), n});
+            size_t n = client.recv(buf);
+            if (n > 0) client.send({buf.data(), n});
         }
     });
 
@@ -223,13 +224,14 @@ TEST_F(TCPSocketTest, LargePayloadTransfer) {
 
     std::promise<std::vector<std::byte>> received_promise;
     std::thread server_thread([&] {
-        auto client = server.accept();
-        if (!client) { received_promise.set_value({}); return; }
+        auto result = server.accept();
+        if (!result) { received_promise.set_value({}); return; }
+        auto& client = result.value();
 
         std::vector<std::byte> accumulated;
         std::vector<std::byte> buf(4096);
         while (accumulated.size() < DATA_SIZE) {
-            size_t n = client->recv(buf);
+            size_t n = client.recv(buf);
             if (n == 0) break;
             accumulated.insert(accumulated.end(), buf.begin(), buf.begin() + n);
         }
@@ -274,21 +276,14 @@ TEST_F(TCPSocketTest, RecvOnClosedSocketReturnsZero) {
 }
 
 // ---------------------------------------------------------------------------
-// Accepted socket lifecycle
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // SO_REUSEADDR
 // ---------------------------------------------------------------------------
 
 TEST_F(TCPSocketTest, ReuseAddrAllowsRebindAfterClose) {
-    // Without reuse_addr, a recently-closed server socket leaves the port
-    // in TIME_WAIT and a second bind would fail. With reuse_addr, it succeeds.
     {
         TCPSocket first({.port = TCP_PORT_CLOSE_SEND, .reuse_addr = true});
         ASSERT_TRUE(first.bind());
         ASSERT_TRUE(first.listen());
-        // first goes out of scope, socket closes
     }
     TCPSocket second({.port = TCP_PORT_CLOSE_SEND, .reuse_addr = true});
     EXPECT_TRUE(second.bind());
@@ -310,8 +305,8 @@ TEST_F(TCPSocketTest, AcceptedSocketIsValid) {
 
     std::promise<bool> accepted_valid;
     std::thread server_thread([&] {
-        auto client = server.accept();
-        accepted_valid.set_value(client != nullptr && client->valid());
+        auto result = server.accept();
+        accepted_valid.set_value(result && result.value().valid());
     });
 
     std::this_thread::sleep_for(10ms);

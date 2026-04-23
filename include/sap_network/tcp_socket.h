@@ -1,24 +1,29 @@
 #pragma once
-#include "sap_network/isocket.h"
 #include "sap_network/platform.h"
 #include "sap_network/socket_config.h"
 
+#include <sap_core/stl/result.h>
+
 namespace sap::network {
 
-    class TCPSocket : public ISocket {
+    class TCPSocket {
     public:
         explicit TCPSocket(SocketConfig config);
-        ~TCPSocket() override;
+        TCPSocket(TCPSocket&&) noexcept;
+        TCPSocket& operator=(TCPSocket&&) noexcept;
+        TCPSocket(const TCPSocket&) = delete;
+        TCPSocket& operator=(const TCPSocket&) = delete;
+        ~TCPSocket();
 
-        bool bind() override;
-        bool listen() override;
-        bool connect() override;
-        stl::unique_ptr<ISocket> accept() override;
-        size_t send(stl::span<const std::byte> data) override;
-        size_t recv(stl::span<std::byte> data) override;
-        void close() override;
-        bool valid() const override;
-        inline const SocketConfig& config() const override { return m_config; }
+        bool bind();
+        bool listen();
+        bool connect();
+        stl::result<TCPSocket> accept();
+        size_t send(stl::span<const std::byte> data);
+        size_t recv(stl::span<std::byte> data);
+        void close();
+        bool valid() const;
+        inline const SocketConfig& config() const { return m_config; }
 
         void set_recv_timeout(std::chrono::milliseconds ms);
         void set_send_timeout(std::chrono::milliseconds ms);
@@ -27,7 +32,7 @@ namespace sap::network {
         explicit TCPSocket(SocketHandle handle);
         bool connect_with_timeout(const sockaddr* addr, socklen_t len) const;
 
-        SocketHandle m_handle;
+        SocketHandle m_handle{INVALID_SOCKET_HANDLE};
         SocketConfig m_config;
     };
 

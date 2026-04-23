@@ -90,21 +90,6 @@ TEST_F(UDPSocketTest, BindToSamePortTwiceFails) {
 }
 
 // ---------------------------------------------------------------------------
-// ISocket contract: listen / accept
-// ---------------------------------------------------------------------------
-
-TEST_F(UDPSocketTest, ListenReturnsFalse) {
-    UDPSocket sock({.port = UDP_PORT_BIND_A});
-    EXPECT_FALSE(sock.listen());
-}
-
-TEST_F(UDPSocketTest, AcceptReturnsNullptr) {
-    UDPSocket sock({.port = UDP_PORT_BIND_B});
-    ASSERT_TRUE(sock.bind());
-    EXPECT_EQ(sock.accept(), nullptr); // unique_ptr comparison to nullptr is well-defined
-}
-
-// ---------------------------------------------------------------------------
 // Connect — negative case
 // ---------------------------------------------------------------------------
 
@@ -115,9 +100,6 @@ TEST_F(UDPSocketTest, ConnectToInvalidHostnameFails) {
 
 // ---------------------------------------------------------------------------
 // One-way send → recv
-//
-// Receiver: bind to RX_PORT, call recv().
-// Sender:   connect to 127.0.0.1:RX_PORT (sets default peer), call send().
 // ---------------------------------------------------------------------------
 
 TEST_F(UDPSocketTest, SendRecvRoundTrip) {
@@ -140,13 +122,6 @@ TEST_F(UDPSocketTest, SendRecvRoundTrip) {
 
 // ---------------------------------------------------------------------------
 // Bidirectional exchange
-//
-// Since SocketConfig.port drives both bind() and connect(), each direction
-// uses a separate sender socket connected to the other side's bound port.
-//
-//   rx_a  binds to BIDIR_A          rx_b  binds to BIDIR_B
-//   tx_ab connects to BIDIR_B  →  rx_b receives
-//   tx_ba connects to BIDIR_A  →  rx_a receives
 // ---------------------------------------------------------------------------
 
 TEST_F(UDPSocketTest, BidirectionalExchange) {
@@ -158,7 +133,6 @@ TEST_F(UDPSocketTest, BidirectionalExchange) {
     ASSERT_TRUE(rx_a.bind());
     ASSERT_TRUE(rx_b.bind());
 
-    // A→B: connect to BIDIR_B and send.
     UDPSocket tx_ab({.host = "127.0.0.1", .port = UDP_PORT_BIDIR_B});
     ASSERT_TRUE(tx_ab.connect());
     EXPECT_EQ(tx_ab.send(to_bytes(ping)), ping.size());
@@ -168,7 +142,6 @@ TEST_F(UDPSocketTest, BidirectionalExchange) {
     ASSERT_EQ(n, ping.size());
     EXPECT_EQ(from_bytes(rbuf, n), ping);
 
-    // B→A: connect to BIDIR_A and send.
     UDPSocket tx_ba({.host = "127.0.0.1", .port = UDP_PORT_BIDIR_A});
     ASSERT_TRUE(tx_ba.connect());
     EXPECT_EQ(tx_ba.send(to_bytes(pong)), pong.size());

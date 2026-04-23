@@ -12,8 +12,10 @@ endif()
 
 add_library(sap_network_lib STATIC
     src/platform.cpp
-    src/tcp_socket.cpp
-    src/udp_socket.cpp
+    $<$<PLATFORM_ID:Linux>:src/tcp_socket_posix.cpp>
+    $<$<PLATFORM_ID:Windows>:src/tcp_socket_windows.cpp>
+    $<$<PLATFORM_ID:Linux>:src/udp_socket_posix.cpp>
+    $<$<PLATFORM_ID:Windows>:src/udp_socket_windows.cpp>
 )
 add_library(sap::network ALIAS sap_network_lib)
 
