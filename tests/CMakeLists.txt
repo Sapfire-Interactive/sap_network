@@ -12,12 +12,15 @@ FetchContent_MakeAvailable(googletest)
 add_executable(sap_network_tests
     test_tcp_socket.cpp
     test_udp_socket.cpp
+    test_tls_socket.cpp
 )
 
 target_link_libraries(sap_network_tests
     PRIVATE
         sap_network_lib
         GTest::gtest_main
+        OpenSSL::SSL
+        OpenSSL::Crypto
 )
 
 target_include_directories(sap_network_tests

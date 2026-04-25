@@ -18,9 +18,7 @@ namespace sap::network {
 
     namespace {
 
-        bool connect_blocking(SocketHandle h, const sockaddr* addr, socklen_t len) {
-            return ::connect(h, addr, len) == 0;
-        }
+        bool connect_blocking(SocketHandle h, const sockaddr* addr, socklen_t len) { return ::connect(h, addr, len) == 0; }
 
         bool connect_with_timeout(SocketHandle h, const sockaddr* addr, socklen_t len, std::chrono::milliseconds timeout) {
             set_nonblocking(h, true);
@@ -93,8 +91,8 @@ namespace sap::network {
         if (::getaddrinfo(m_config.host.c_str(), port_str.c_str(), &hints, &res) != 0)
             return false;
         bool ok = m_config.connect_timeout.count() > 0
-                      ? connect_with_timeout(m_handle, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen), m_config.connect_timeout)
-                      : connect_blocking(m_handle, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen));
+            ? connect_with_timeout(m_handle, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen), m_config.connect_timeout)
+            : connect_blocking(m_handle, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen));
         ::freeaddrinfo(res);
         return ok;
     }

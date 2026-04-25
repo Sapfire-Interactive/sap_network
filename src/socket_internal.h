@@ -9,15 +9,15 @@
 #include <string>
 
 #ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #else
-    #include <arpa/inet.h>
-    #include <fcntl.h>
-    #include <netdb.h>
-    #include <netinet/in.h>
-    #include <sys/socket.h>
-    #include <unistd.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 namespace sap::network::internal {
@@ -44,7 +44,8 @@ namespace sap::network::internal {
         ::ioctlsocket(h, FIONBIO, &mode);
 #else
         int flags = ::fcntl(h, F_GETFL, 0);
-        if (flags < 0) return;
+        if (flags < 0)
+            return;
         ::fcntl(h, F_SETFL, enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
 #endif
     }
@@ -62,8 +63,8 @@ namespace sap::network::internal {
     inline std::string error_message(int err) {
 #ifdef _WIN32
         char buf[256]{};
-        ::FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                         nullptr, static_cast<DWORD>(err), 0, buf, sizeof(buf), nullptr);
+        ::FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, static_cast<DWORD>(err), 0, buf, sizeof(buf),
+                         nullptr);
         std::string msg{buf};
         while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r' || msg.back() == ' ' || msg.back() == '.'))
             msg.pop_back();

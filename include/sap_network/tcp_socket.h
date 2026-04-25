@@ -1,7 +1,7 @@
 #pragma once
 #include "sap_network/platform.h"
-#include "sap_network/socket_config.h"
 #include "sap_network/socket_concept.h"
+#include "sap_network/socket_config.h"
 
 #include <sap_core/stl/result.h>
 
@@ -28,6 +28,8 @@ namespace sap::network {
 
         void set_recv_timeout(std::chrono::milliseconds ms);
         void set_send_timeout(std::chrono::milliseconds ms);
+
+        inline SocketHandle native_handle() { return m_handle; }
 
     private:
         explicit TCPSocket(SocketHandle handle);
