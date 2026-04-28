@@ -44,6 +44,11 @@ static constexpr u16 TLS_PORT_WIRELOG   = 19311;
 static constexpr u16 TLS_PORT_CONCEPT   = 19312;
 static constexpr u16 TLS_PORT_REUSE     = 19313;
 static constexpr u16 TLS_PORT_CLOSE_RACE = 19314;
+static constexpr u16 TLS_PORT_MTLS_NO_CA      = 19315;
+static constexpr u16 TLS_PORT_MTLS_NO_CLIENT  = 19316;
+static constexpr u16 TLS_PORT_MTLS_ACCEPT     = 19317;
+static constexpr u16 TLS_PORT_MTLS_UNTRUSTED  = 19318;
+static constexpr u16 TLS_PORT_MTLS_OPTIONAL   = 19319;
 
 // ---------------------------------------------------------------------------
 // Concept compile-time check
@@ -123,6 +128,139 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Test CA — issues leaf certs (server or client) signed by a single CA root.
+// Used by mTLS tests where both ends of the chain need to be controllable.
+// ---------------------------------------------------------------------------
+
+class CertAuthority {
+public:
+    explicit CertAuthority(const std::string& cn = "Test CA") {
+        std::random_device rd;
+        m_dir = fs::temp_directory_path() / fs::path{"sap_tls_ca_" + std::to_string(rd())};
+        fs::create_directories(m_dir);
+        ca_cert_file = (m_dir / "ca.pem").string();
+
+        m_pkey = ::EVP_RSA_gen(2048);
+        EXPECT_NE(m_pkey, nullptr);
+        m_cert = make_ca_cert(cn, m_pkey);
+        EXPECT_NE(m_cert, nullptr);
+        write_cert(ca_cert_file, m_cert);
+    }
+
+    ~CertAuthority() {
+        if (m_cert)
+            ::X509_free(m_cert);
+        if (m_pkey)
+            ::EVP_PKEY_free(m_pkey);
+        std::error_code ec;
+        fs::remove_all(m_dir, ec);
+    }
+
+    CertAuthority(const CertAuthority&) = delete;
+    CertAuthority& operator=(const CertAuthority&) = delete;
+
+    struct Issued {
+        std::string cert_file;
+        std::string key_file;
+    };
+
+    // is_server=true issues a leaf with SAN=DNS:localhost,IP:127.0.0.1 so it
+    // also passes hostname verification when used as a server cert.
+    Issued issue_leaf(const std::string& cn, bool is_server) {
+        std::random_device rd;
+        std::string base = "leaf_" + std::to_string(rd());
+        Issued out{(m_dir / (base + ".pem")).string(), (m_dir / (base + ".key")).string()};
+
+        EVP_PKEY* pkey = ::EVP_RSA_gen(2048);
+        EXPECT_NE(pkey, nullptr);
+        X509* x509 = make_leaf_cert(cn, pkey, m_cert, m_pkey, is_server);
+        EXPECT_NE(x509, nullptr);
+
+        write_cert(out.cert_file, x509);
+        write_key(out.key_file, pkey);
+
+        ::X509_free(x509);
+        ::EVP_PKEY_free(pkey);
+        return out;
+    }
+
+    std::string ca_cert_file;
+
+private:
+    static X509* make_ca_cert(const std::string& cn, EVP_PKEY* pkey) {
+        X509* x = ::X509_new();
+        ::ASN1_INTEGER_set(::X509_get_serialNumber(x), 1);
+        ::X509_gmtime_adj(::X509_getm_notBefore(x), 0);
+        ::X509_gmtime_adj(::X509_getm_notAfter(x), 31536000L);
+        ::X509_set_pubkey(x, pkey);
+
+        X509_NAME* name = ::X509_get_subject_name(x);
+        ::X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
+        ::X509_set_issuer_name(x, name); // self-issued
+
+        X509V3_CTX v3ctx;
+        X509V3_set_ctx_nodb(&v3ctx);
+        ::X509V3_set_ctx(&v3ctx, x, x, nullptr, nullptr, 0);
+        if (X509_EXTENSION* ext = ::X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_basic_constraints, "critical,CA:TRUE")) {
+            ::X509_add_ext(x, ext, -1);
+            ::X509_EXTENSION_free(ext);
+        }
+        if (X509_EXTENSION* ext = ::X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_key_usage, "critical,keyCertSign,cRLSign")) {
+            ::X509_add_ext(x, ext, -1);
+            ::X509_EXTENSION_free(ext);
+        }
+
+        ::X509_sign(x, pkey, ::EVP_sha256());
+        return x;
+    }
+
+    static X509* make_leaf_cert(const std::string& cn, EVP_PKEY* pkey, X509* ca_cert, EVP_PKEY* ca_pkey, bool is_server) {
+        X509* x = ::X509_new();
+        std::random_device rd;
+        ::ASN1_INTEGER_set(::X509_get_serialNumber(x), static_cast<long>(rd() & 0x7fffffff));
+        ::X509_gmtime_adj(::X509_getm_notBefore(x), 0);
+        ::X509_gmtime_adj(::X509_getm_notAfter(x), 31536000L);
+        ::X509_set_pubkey(x, pkey);
+
+        X509_NAME* name = ::X509_get_subject_name(x);
+        ::X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
+        ::X509_set_issuer_name(x, ::X509_get_subject_name(ca_cert));
+
+        if (is_server) {
+            X509V3_CTX v3ctx;
+            X509V3_set_ctx_nodb(&v3ctx);
+            ::X509V3_set_ctx(&v3ctx, ca_cert, x, nullptr, nullptr, 0);
+            if (X509_EXTENSION* ext =
+                    ::X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1")) {
+                ::X509_add_ext(x, ext, -1);
+                ::X509_EXTENSION_free(ext);
+            }
+        }
+
+        ::X509_sign(x, ca_pkey, ::EVP_sha256());
+        return x;
+    }
+
+    static void write_cert(const std::string& path, X509* cert) {
+        FILE* fp = std::fopen(path.c_str(), "wb");
+        ASSERT_NE(fp, nullptr);
+        ::PEM_write_X509(fp, cert);
+        std::fclose(fp);
+    }
+
+    static void write_key(const std::string& path, EVP_PKEY* pkey) {
+        FILE* fp = std::fopen(path.c_str(), "wb");
+        ASSERT_NE(fp, nullptr);
+        ::PEM_write_PrivateKey(fp, pkey, nullptr, nullptr, 0, nullptr, nullptr);
+        std::fclose(fp);
+    }
+
+    EVP_PKEY* m_pkey = nullptr;
+    X509* m_cert = nullptr;
+    fs::path m_dir;
+};
+
+// ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
@@ -148,38 +286,37 @@ static std::thread spawn_loopback_server(TLSSocket& server, Body body) {
 // ---------------------------------------------------------------------------
 
 TEST_F(TLSSocketTest, ClientConstructionProducesValidTcp) {
-    TLSSocket sock({.tcp = {.host = "127.0.0.1", .port = TLS_PORT_BIND}});
+    TLSSocket sock(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = TLS_PORT_BIND}});
     EXPECT_TRUE(sock.valid());
 }
 
 TEST_F(TLSSocketTest, ServerConstructionProducesValidTcp) {
     SelfSignedCert cert;
-    TLSSocket sock({.tcp              = {.port = TLS_PORT_BIND, .reuse_addr = true},
-                    .role             = ETlsRole::Server,
-                    .server_cert_file = cert.cert_file,
-                    .server_key_file  = cert.key_file});
+    TLSSocket sock(TlsServerConfig{.tcp       = {.port = TLS_PORT_BIND, .reuse_addr = true},
+                                   .cert_file = cert.cert_file,
+                                   .key_file  = cert.key_file});
     EXPECT_TRUE(sock.valid());
 }
 
 TEST_F(TLSSocketTest, CloseInvalidates) {
-    TLSSocket sock({.tcp = {.port = TLS_PORT_BIND}});
+    TLSSocket sock(TlsClientConfig{.tcp = {.port = TLS_PORT_BIND}});
     sock.close();
     EXPECT_FALSE(sock.valid());
 }
 
 TEST_F(TLSSocketTest, DoubleCloseIsSafe) {
-    TLSSocket sock({.tcp = {.port = TLS_PORT_BIND}});
+    TLSSocket sock(TlsClientConfig{.tcp = {.port = TLS_PORT_BIND}});
     sock.close();
     EXPECT_NO_FATAL_FAILURE(sock.close());
     EXPECT_FALSE(sock.valid());
 }
 
 TEST_F(TLSSocketTest, DestructorCleansUp) {
-    { TLSSocket sock({.tcp = {.port = TLS_PORT_BIND}}); }
+    { TLSSocket sock(TlsClientConfig{.tcp = {.port = TLS_PORT_BIND}}); }
 }
 
 TEST_F(TLSSocketTest, MoveConstructionTransfersOwnership) {
-    TLSSocket a({.tcp = {.port = TLS_PORT_BIND}});
+    TLSSocket a(TlsClientConfig{.tcp = {.port = TLS_PORT_BIND}});
     ASSERT_TRUE(a.valid());
     TLSSocket b(std::move(a));
     EXPECT_TRUE(b.valid());
@@ -187,16 +324,16 @@ TEST_F(TLSSocketTest, MoveConstructionTransfersOwnership) {
 }
 
 TEST_F(TLSSocketTest, MoveAssignmentTransfersOwnership) {
-    TLSSocket a({.tcp = {.port = TLS_PORT_BIND}});
-    TLSSocket b({.tcp = {.port = static_cast<u16>(TLS_PORT_BIND + 1)}});
+    TLSSocket a(TlsClientConfig{.tcp = {.port = TLS_PORT_BIND}});
+    TLSSocket b(TlsClientConfig{.tcp = {.port = static_cast<u16>(TLS_PORT_BIND + 1)}});
     b = std::move(a);
     EXPECT_TRUE(b.valid());
     EXPECT_FALSE(a.valid());
 }
 
 TEST_F(TLSSocketTest, MoveAssignmentClosesOldHandle) {
-    TLSSocket a({.tcp = {.port = TLS_PORT_REUSE, .reuse_addr = true}});
-    TLSSocket b({.tcp = {.port = TLS_PORT_REUSE, .reuse_addr = true}});
+    TLSSocket a(TlsClientConfig{.tcp = {.port = TLS_PORT_REUSE, .reuse_addr = true}});
+    TLSSocket b(TlsClientConfig{.tcp = {.port = TLS_PORT_REUSE, .reuse_addr = true}});
     // a's TCP fd is alive; move-assign should close it before taking b's.
     a = std::move(b);
     EXPECT_TRUE(a.valid());
@@ -208,7 +345,7 @@ TEST_F(TLSSocketTest, MoveAssignmentClosesOldHandle) {
 // ---------------------------------------------------------------------------
 
 TEST_F(TLSSocketTest, SendBeforeHandshakeFails) {
-    TLSSocket sock({.tcp = {.host = "127.0.0.1", .port = 19999}});
+    TLSSocket sock(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = 19999}});
     std::vector<std::byte> buf{std::byte{1}, std::byte{2}};
     auto r = sock.send(buf);
     EXPECT_FALSE(r);
@@ -216,7 +353,7 @@ TEST_F(TLSSocketTest, SendBeforeHandshakeFails) {
 }
 
 TEST_F(TLSSocketTest, RecvBeforeHandshakeFails) {
-    TLSSocket sock({.tcp = {.host = "127.0.0.1", .port = 19999}});
+    TLSSocket sock(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = 19999}});
     std::vector<std::byte> buf(16);
     auto r = sock.recv(buf);
     EXPECT_FALSE(r);
@@ -228,14 +365,14 @@ TEST_F(TLSSocketTest, RecvBeforeHandshakeFails) {
 // ---------------------------------------------------------------------------
 
 TEST_F(TLSSocketTest, SendOnClosedSocketFails) {
-    TLSSocket sock({.tcp = {.port = TLS_PORT_BIND}});
+    TLSSocket sock(TlsClientConfig{.tcp = {.port = TLS_PORT_BIND}});
     sock.close();
     std::vector<std::byte> buf{std::byte{1}, std::byte{2}};
     EXPECT_FALSE(sock.send(buf));
 }
 
 TEST_F(TLSSocketTest, RecvOnClosedSocketFails) {
-    TLSSocket sock({.tcp = {.port = TLS_PORT_BIND}});
+    TLSSocket sock(TlsClientConfig{.tcp = {.port = TLS_PORT_BIND}});
     sock.close();
     std::vector<std::byte> buf(16);
     EXPECT_FALSE(sock.recv(buf));
@@ -246,17 +383,16 @@ TEST_F(TLSSocketTest, RecvOnClosedSocketFails) {
 // ---------------------------------------------------------------------------
 
 TEST_F(TLSSocketTest, ConnectToClosedPortFails) {
-    TLSSocket sock(
-        {.tcp = {.host = "127.0.0.1", .port = 19998, .connect_timeout = 200ms}, .verify_peer = false, .verify_hostname = false});
+    TLSSocket sock(TlsClientConfig{
+        .tcp = {.host = "127.0.0.1", .port = 19998, .connect_timeout = 200ms}, .verify_peer = false, .verify_hostname = false});
     EXPECT_FALSE(sock.connect());
     EXPECT_FALSE(sock.handshake_error().empty());
 }
 
 TEST_F(TLSSocketTest, ServerWithoutCertFailsAtAccept) {
-    // Server has role=Server but no server_cert_file/key. acquire_ctx returns
-    // nullptr; accept() must report this rather than dispatching SSL_accept.
-    TLSSocket server({.tcp  = {.port = TLS_PORT_NOCERT, .listen_backlog = 1, .reuse_addr = true},
-                      .role = ETlsRole::Server});
+    // Server with no cert_file/key_file. acquire_ctx returns nullptr; accept()
+    // must report this rather than dispatching SSL_accept.
+    TLSSocket server(TlsServerConfig{.tcp = {.port = TLS_PORT_NOCERT, .listen_backlog = 1, .reuse_addr = true}});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -268,9 +404,9 @@ TEST_F(TLSSocketTest, ServerWithoutCertFailsAtAccept) {
 
     // Trigger a connection so the server's accept() unblocks. We don't care
     // whether the client handshake succeeds.
-    TLSSocket client({.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_NOCERT, .connect_timeout = 500ms},
-                      .verify_peer     = false,
-                      .verify_hostname = false});
+    TLSSocket client(TlsClientConfig{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_NOCERT, .connect_timeout = 500ms},
+                                     .verify_peer     = false,
+                                     .verify_hostname = false});
     client.connect();
 
     server_thread.join();
@@ -292,9 +428,9 @@ TEST_F(TLSSocketTest, ConnectToPlainTcpServerFails) {
 
     std::this_thread::sleep_for(50ms);
 
-    TLSSocket client({.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_BAD_PROTO, .connect_timeout = 1000ms},
-                      .verify_peer     = false,
-                      .verify_hostname = false});
+    TLSSocket client(TlsClientConfig{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_BAD_PROTO, .connect_timeout = 1000ms},
+                                     .verify_peer     = false,
+                                     .verify_hostname = false});
     EXPECT_FALSE(client.connect());
     EXPECT_FALSE(client.handshake_error().empty());
 
@@ -307,10 +443,9 @@ TEST_F(TLSSocketTest, ConnectToPlainTcpServerFails) {
 
 TEST_F(TLSSocketTest, AcceptOnNonListeningSocketFails) {
     SelfSignedCert cert;
-    TLSSocket server({.tcp              = {.port = TLS_PORT_BIND, .reuse_addr = true},
-                      .role             = ETlsRole::Server,
-                      .server_cert_file = cert.cert_file,
-                      .server_key_file  = cert.key_file});
+    TLSSocket server(TlsServerConfig{.tcp       = {.port = TLS_PORT_BIND, .reuse_addr = true},
+                                     .cert_file = cert.cert_file,
+                                     .key_file  = cert.key_file});
     auto r = server.accept();
     EXPECT_FALSE(r);
 }
@@ -322,10 +457,9 @@ TEST_F(TLSSocketTest, AcceptOnNonListeningSocketFails) {
 TEST_F(TLSSocketTest, ClientServerRoundTrip) {
     SelfSignedCert cert;
 
-    TLSSocket server({.tcp              = {.port = TLS_PORT_HANDSHAKE, .listen_backlog = 1, .reuse_addr = true},
-                      .role             = ETlsRole::Server,
-                      .server_cert_file = cert.cert_file,
-                      .server_key_file  = cert.key_file});
+    TLSSocket server(TlsServerConfig{.tcp       = {.port = TLS_PORT_HANDSHAKE, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file = cert.cert_file,
+                                     .key_file  = cert.key_file});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -343,8 +477,8 @@ TEST_F(TLSSocketTest, ClientServerRoundTrip) {
 
     std::this_thread::sleep_for(50ms);
 
-    TLSSocket client(
-        {.tcp = {.host = "127.0.0.1", .port = TLS_PORT_HANDSHAKE}, .verify_peer = false, .verify_hostname = false});
+    TLSSocket client(TlsClientConfig{
+        .tcp = {.host = "127.0.0.1", .port = TLS_PORT_HANDSHAKE}, .verify_peer = false, .verify_hostname = false});
     ASSERT_TRUE(client.connect()) << client.handshake_error();
 
     const std::string payload = "Hello, TLS!";
@@ -372,10 +506,9 @@ TEST_F(TLSSocketTest, ClientServerRoundTrip) {
 TEST_F(TLSSocketTest, SelfSignedFailsWhenVerifyPeerIsOn) {
     SelfSignedCert cert;
 
-    TLSSocket server({.tcp              = {.port = TLS_PORT_VERIFY, .listen_backlog = 1, .reuse_addr = true},
-                      .role             = ETlsRole::Server,
-                      .server_cert_file = cert.cert_file,
-                      .server_key_file  = cert.key_file});
+    TLSSocket server(TlsServerConfig{.tcp       = {.port = TLS_PORT_VERIFY, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file = cert.cert_file,
+                                     .key_file  = cert.key_file});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -383,9 +516,9 @@ TEST_F(TLSSocketTest, SelfSignedFailsWhenVerifyPeerIsOn) {
 
     std::this_thread::sleep_for(50ms);
 
-    TLSSocket client({.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_VERIFY, .connect_timeout = 1000ms},
-                      .verify_peer     = true,
-                      .verify_hostname = false});
+    TLSSocket client(TlsClientConfig{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_VERIFY, .connect_timeout = 1000ms},
+                                     .verify_peer     = true,
+                                     .verify_hostname = false});
     EXPECT_FALSE(client.connect());
     // OpenSSL surfaces "self-signed" / "self signed" verbatim; either spelling
     // is acceptable across versions.
@@ -404,10 +537,9 @@ TEST_F(TLSSocketTest, HostnameMismatchFails) {
 
     // Cert has SAN=localhost,127.0.0.1. We connect to 127.0.0.1 but tell the
     // verifier to check for "wrong.example" — must fail.
-    TLSSocket server({.tcp              = {.port = TLS_PORT_HOSTNAME, .listen_backlog = 1, .reuse_addr = true},
-                      .role             = ETlsRole::Server,
-                      .server_cert_file = cert.cert_file,
-                      .server_key_file  = cert.key_file});
+    TLSSocket server(TlsServerConfig{.tcp       = {.port = TLS_PORT_HOSTNAME, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file = cert.cert_file,
+                                     .key_file  = cert.key_file});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -415,20 +547,15 @@ TEST_F(TLSSocketTest, HostnameMismatchFails) {
 
     std::this_thread::sleep_for(50ms);
 
-    TLSSocket client({.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_HOSTNAME, .connect_timeout = 1000ms},
-                      .sni_hostname    = "wrong.example",
-                      .verify_peer     = false, // skip CA chain check; isolate the hostname check
-                      .verify_hostname = true,
-                      .ca_file         = cert.cert_file}); // trust the self-signed root for hostname-only test
-    // verify_peer=false but verify_hostname=true would normally still pass
-    // because OpenSSL only enforces hostname when verify_peer is on. Force the
-    // chain through ca_file + verify_peer to make this a tight check:
-    TlsConfig tighter{.tcp              = {.host = "127.0.0.1", .port = TLS_PORT_HOSTNAME, .connect_timeout = 1000ms},
-                      .sni_hostname     = "wrong.example",
-                      .verify_peer      = true,
-                      .verify_hostname  = true,
-                      .ca_file          = cert.cert_file};
-    TLSSocket strict{tighter};
+    // verify_peer=false but verify_hostname=true would silently no-op because
+    // OpenSSL only enforces hostname when verify_peer is on. Force the chain
+    // through ca_file + verify_peer to make this a tight check.
+    TlsClientConfig tighter{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_HOSTNAME, .connect_timeout = 1000ms},
+                            .sni_hostname    = "wrong.example",
+                            .verify_peer     = true,
+                            .verify_hostname = true,
+                            .ca_file         = cert.cert_file};
+    TLSSocket strict{std::move(tighter)};
     EXPECT_FALSE(strict.connect());
     EXPECT_FALSE(strict.handshake_error().empty());
 
@@ -442,10 +569,9 @@ TEST_F(TLSSocketTest, HostnameMismatchFails) {
 TEST_F(TLSSocketTest, AlpnNegotiation) {
     SelfSignedCert cert;
 
-    TlsConfig server_cfg{.tcp              = {.port = TLS_PORT_ALPN, .listen_backlog = 1, .reuse_addr = true},
-                         .role             = ETlsRole::Server,
-                         .server_cert_file = cert.cert_file,
-                         .server_key_file  = cert.key_file};
+    TlsServerConfig server_cfg{.tcp       = {.port = TLS_PORT_ALPN, .listen_backlog = 1, .reuse_addr = true},
+                               .cert_file = cert.cert_file,
+                               .key_file  = cert.key_file};
     server_cfg.alpn_protocols.push_back("h2");
     server_cfg.alpn_protocols.push_back("http/1.1");
     TLSSocket server(std::move(server_cfg));
@@ -458,9 +584,9 @@ TEST_F(TLSSocketTest, AlpnNegotiation) {
 
     std::this_thread::sleep_for(50ms);
 
-    TlsConfig client_cfg{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_ALPN},
-                         .verify_peer     = false,
-                         .verify_hostname = false};
+    TlsClientConfig client_cfg{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_ALPN},
+                               .verify_peer     = false,
+                               .verify_hostname = false};
     // Client offers both; server's first preference (h2) wins.
     client_cfg.alpn_protocols.push_back("http/1.1");
     client_cfg.alpn_protocols.push_back("h2");
@@ -480,10 +606,9 @@ TEST_F(TLSSocketTest, AlpnNegotiation) {
 TEST_F(TLSSocketTest, IntrospectionPopulatedAfterHandshake) {
     SelfSignedCert cert;
 
-    TLSSocket server({.tcp              = {.port = TLS_PORT_CIPHER, .listen_backlog = 1, .reuse_addr = true},
-                      .role             = ETlsRole::Server,
-                      .server_cert_file = cert.cert_file,
-                      .server_key_file  = cert.key_file});
+    TLSSocket server(TlsServerConfig{.tcp       = {.port = TLS_PORT_CIPHER, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file = cert.cert_file,
+                                     .key_file  = cert.key_file});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -494,8 +619,8 @@ TEST_F(TLSSocketTest, IntrospectionPopulatedAfterHandshake) {
 
     std::this_thread::sleep_for(50ms);
 
-    TLSSocket client(
-        {.tcp = {.host = "127.0.0.1", .port = TLS_PORT_CIPHER}, .verify_peer = false, .verify_hostname = false});
+    TLSSocket client(TlsClientConfig{
+        .tcp = {.host = "127.0.0.1", .port = TLS_PORT_CIPHER}, .verify_peer = false, .verify_hostname = false});
     ASSERT_TRUE(client.connect()) << client.handshake_error();
 
     EXPECT_FALSE(client.negotiated_cipher().empty());
@@ -508,7 +633,7 @@ TEST_F(TLSSocketTest, IntrospectionPopulatedAfterHandshake) {
 }
 
 TEST_F(TLSSocketTest, IntrospectionEmptyBeforeHandshake) {
-    TLSSocket sock({.tcp = {.host = "127.0.0.1", .port = 19999}});
+    TLSSocket sock(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = 19999}});
     EXPECT_TRUE(sock.negotiated_protocol().empty());
     EXPECT_TRUE(sock.negotiated_cipher().empty());
     EXPECT_TRUE(sock.negotiated_tls_version().empty());
@@ -523,11 +648,10 @@ TEST_F(TLSSocketTest, IntrospectionEmptyBeforeHandshake) {
 TEST_F(TLSSocketTest, MinVersionTls13Negotiates) {
     SelfSignedCert cert;
 
-    TLSSocket server({.tcp              = {.port = TLS_PORT_VERSION, .listen_backlog = 1, .reuse_addr = true},
-                      .role             = ETlsRole::Server,
-                      .server_cert_file = cert.cert_file,
-                      .server_key_file  = cert.key_file,
-                      .min_version      = TlsConfig::EMinVersion::TLS_1_3});
+    TLSSocket server(TlsServerConfig{.tcp         = {.port = TLS_PORT_VERSION, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file   = cert.cert_file,
+                                     .key_file    = cert.key_file,
+                                     .min_version = ETlsMinVersion::TLS_1_3});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -538,10 +662,10 @@ TEST_F(TLSSocketTest, MinVersionTls13Negotiates) {
 
     std::this_thread::sleep_for(50ms);
 
-    TLSSocket client({.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_VERSION},
-                      .verify_peer     = false,
-                      .verify_hostname = false,
-                      .min_version     = TlsConfig::EMinVersion::TLS_1_3});
+    TLSSocket client(TlsClientConfig{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_VERSION},
+                                     .verify_peer     = false,
+                                     .verify_hostname = false,
+                                     .min_version     = ETlsMinVersion::TLS_1_3});
     ASSERT_TRUE(client.connect()) << client.handshake_error();
     EXPECT_EQ(client.negotiated_tls_version(), "TLSv1.3");
 
@@ -561,10 +685,9 @@ TEST_F(TLSSocketTest, LargePayloadRoundTrip) {
     for (size_t i = 0; i < DATA_SIZE; ++i)
         data[i] = static_cast<std::byte>(i & 0xFF);
 
-    TLSSocket server({.tcp              = {.port = TLS_PORT_LARGE, .listen_backlog = 1, .reuse_addr = true},
-                      .role             = ETlsRole::Server,
-                      .server_cert_file = cert.cert_file,
-                      .server_key_file  = cert.key_file});
+    TLSSocket server(TlsServerConfig{.tcp       = {.port = TLS_PORT_LARGE, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file = cert.cert_file,
+                                     .key_file  = cert.key_file});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -583,8 +706,8 @@ TEST_F(TLSSocketTest, LargePayloadRoundTrip) {
 
     std::this_thread::sleep_for(50ms);
 
-    TLSSocket client(
-        {.tcp = {.host = "127.0.0.1", .port = TLS_PORT_LARGE}, .verify_peer = false, .verify_hostname = false});
+    TLSSocket client(TlsClientConfig{
+        .tcp = {.host = "127.0.0.1", .port = TLS_PORT_LARGE}, .verify_peer = false, .verify_hostname = false});
     ASSERT_TRUE(client.connect()) << client.handshake_error();
 
     size_t total_sent = 0;
@@ -619,10 +742,9 @@ TEST_F(TLSSocketTest, CloseImmediatelyAfterSendDeliversAllBytes) {
     for (size_t i = 0; i < DATA_SIZE; ++i)
         data[i] = static_cast<std::byte>(i & 0xFF);
 
-    TLSSocket server({.tcp              = {.port = TLS_PORT_CLOSE_RACE, .listen_backlog = 1, .reuse_addr = true},
-                      .role             = ETlsRole::Server,
-                      .server_cert_file = cert.cert_file,
-                      .server_key_file  = cert.key_file});
+    TLSSocket server(TlsServerConfig{.tcp       = {.port = TLS_PORT_CLOSE_RACE, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file = cert.cert_file,
+                                     .key_file  = cert.key_file});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -645,8 +767,8 @@ TEST_F(TLSSocketTest, CloseImmediatelyAfterSendDeliversAllBytes) {
 
     std::this_thread::sleep_for(50ms);
 
-    TLSSocket client(
-        {.tcp = {.host = "127.0.0.1", .port = TLS_PORT_CLOSE_RACE}, .verify_peer = false, .verify_hostname = false});
+    TLSSocket client(TlsClientConfig{
+        .tcp = {.host = "127.0.0.1", .port = TLS_PORT_CLOSE_RACE}, .verify_peer = false, .verify_hostname = false});
     ASSERT_TRUE(client.connect()) << client.handshake_error();
 
     // Bulk send, then close immediately — NO application-level ack. The
@@ -689,10 +811,9 @@ static stl::result<size_t> echo_once(S& sock, stl::span<const std::byte> payload
 TEST_F(TLSSocketTest, ConceptSubstitutability) {
     SelfSignedCert cert;
 
-    TLSSocket server({.tcp              = {.port = TLS_PORT_CONCEPT, .listen_backlog = 1, .reuse_addr = true},
-                      .role             = ETlsRole::Server,
-                      .server_cert_file = cert.cert_file,
-                      .server_key_file  = cert.key_file});
+    TLSSocket server(TlsServerConfig{.tcp       = {.port = TLS_PORT_CONCEPT, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file = cert.cert_file,
+                                     .key_file  = cert.key_file});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -705,8 +826,8 @@ TEST_F(TLSSocketTest, ConceptSubstitutability) {
 
     std::this_thread::sleep_for(50ms);
 
-    TLSSocket tls(
-        {.tcp = {.host = "127.0.0.1", .port = TLS_PORT_CONCEPT}, .verify_peer = false, .verify_hostname = false});
+    TLSSocket tls(TlsClientConfig{
+        .tcp = {.host = "127.0.0.1", .port = TLS_PORT_CONCEPT}, .verify_peer = false, .verify_hostname = false});
     ASSERT_TRUE(tls.connect()) << tls.handshake_error();
 
     const std::string payload = "concept";
@@ -724,6 +845,204 @@ TEST_F(TLSSocketTest, ConceptSubstitutability) {
 }
 
 // ---------------------------------------------------------------------------
+// Mutual TLS — server-side client-cert verification
+// ---------------------------------------------------------------------------
+
+TEST_F(TLSSocketTest, ServerRequireClientCertWithoutTrustRootsFailsCtx) {
+    // require_client_cert=true with no ca_file/ca_dir is a misconfig: no client
+    // cert can ever verify. acquire_ctx must fail fast and accept() must surface
+    // the error rather than dispatching SSL_accept.
+    SelfSignedCert cert;
+    TLSSocket server(TlsServerConfig{.tcp                 = {.port = TLS_PORT_MTLS_NO_CA, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file           = cert.cert_file,
+                                     .key_file            = cert.key_file,
+                                     .require_client_cert = true});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+
+    std::promise<bool> got_error;
+    std::thread server_thread([&] {
+        auto r = server.accept();
+        got_error.set_value(!r);
+    });
+
+    // Drive a TCP connection so accept() unblocks; we don't care if the client
+    // handshake succeeds (it won't — the server's ctx build fails first).
+    TLSSocket client(TlsClientConfig{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_MTLS_NO_CA, .connect_timeout = 500ms},
+                                     .verify_peer     = false,
+                                     .verify_hostname = false});
+    client.connect();
+
+    server_thread.join();
+    EXPECT_TRUE(got_error.get_future().get());
+}
+
+TEST_F(TLSSocketTest, ServerRequiringClientCertRejectsAnonymousClient) {
+    CertAuthority ca;
+    auto server_leaf = ca.issue_leaf("localhost", true);
+
+    TLSSocket server(TlsServerConfig{.tcp                 = {.port = TLS_PORT_MTLS_NO_CLIENT, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file           = server_leaf.cert_file,
+                                     .key_file            = server_leaf.key_file,
+                                     .ca_file             = ca.ca_cert_file,
+                                     .require_client_cert = true});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+
+    std::promise<bool> server_failed;
+    std::promise<std::string> server_err;
+    std::thread server_thread([&] {
+        auto r = server.accept();
+        server_failed.set_value(!r);
+        server_err.set_value(r ? std::string{} : std::string{r.error()});
+    });
+
+    std::this_thread::sleep_for(50ms);
+
+    // Client offers no client cert. In TLS 1.3 the client's SSL_connect
+    // returns once the client's Finished is sent — *before* the server has
+    // validated the (missing) client cert. The server's rejection alert is
+    // surfaced on the client only on the next I/O. The authoritative signal
+    // for "mTLS rejected" is the server-side accept() failure asserted below.
+    TLSSocket client(TlsClientConfig{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_MTLS_NO_CLIENT, .connect_timeout = 1000ms},
+                                     .verify_peer     = false,
+                                     .verify_hostname = false});
+    (void)client.connect();
+
+    server_thread.join();
+    EXPECT_TRUE(server_failed.get_future().get());
+    const auto err = server_err.get_future().get();
+    EXPECT_FALSE(err.empty());
+    // OpenSSL surfaces this as "peer did not return a certificate" rather than
+    // a verify error, because there was nothing presented to verify in the
+    // first place. Either spelling is acceptable.
+    EXPECT_TRUE(err.find("certificate") != std::string::npos || err.find("verify") != std::string::npos)
+        << "server error: " << err;
+}
+
+TEST_F(TLSSocketTest, ServerRequiringClientCertAcceptsValidCert) {
+    CertAuthority ca;
+    auto server_leaf = ca.issue_leaf("localhost", true);
+    auto client_leaf = ca.issue_leaf("test-client", false);
+
+    TLSSocket server(TlsServerConfig{.tcp                 = {.port = TLS_PORT_MTLS_ACCEPT, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file           = server_leaf.cert_file,
+                                     .key_file            = server_leaf.key_file,
+                                     .ca_file             = ca.ca_cert_file,
+                                     .require_client_cert = true});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+
+    std::promise<bool> server_ok;
+    std::promise<std::string> server_peer_subject;
+    auto server_thread = spawn_loopback_server(server, [&](TLSSocket& peer) {
+        server_peer_subject.set_value(std::string{peer.peer_cert_subject()});
+        std::vector<std::byte> buf(64);
+        auto r = peer.recv(buf);
+        if (r && r.value() > 0)
+            peer.send({buf.data(), r.value()});
+        server_ok.set_value(true);
+    });
+
+    std::this_thread::sleep_for(50ms);
+
+    TLSSocket client(TlsClientConfig{.tcp              = {.host = "127.0.0.1", .port = TLS_PORT_MTLS_ACCEPT, .connect_timeout = 1000ms},
+                                     .verify_peer      = false,
+                                     .verify_hostname  = false,
+                                     .client_cert_file = client_leaf.cert_file,
+                                     .client_key_file  = client_leaf.key_file});
+    ASSERT_TRUE(client.connect()) << client.handshake_error();
+
+    const std::string payload = "mtls-ok";
+    std::vector<std::byte> sbuf(payload.size());
+    std::memcpy(sbuf.data(), payload.data(), payload.size());
+    ASSERT_TRUE(client.send(sbuf));
+
+    std::vector<std::byte> rbuf(64);
+    auto echoed = client.recv(rbuf);
+    ASSERT_TRUE(echoed);
+    EXPECT_EQ(std::string(reinterpret_cast<char*>(rbuf.data()), echoed.value()), payload);
+
+    client.close();
+    server_thread.join();
+    EXPECT_TRUE(server_ok.get_future().get());
+    // Server's view of the client cert: subject should contain CN=test-client.
+    auto subj = server_peer_subject.get_future().get();
+    EXPECT_NE(subj.find("test-client"), std::string::npos) << "server saw subject: " << subj;
+}
+
+TEST_F(TLSSocketTest, ServerRequiringClientCertRejectsUntrustedCert) {
+    CertAuthority trusted_ca;
+    CertAuthority untrusted_ca;
+    auto server_leaf = trusted_ca.issue_leaf("localhost", true);
+    auto rogue_client = untrusted_ca.issue_leaf("rogue", false);
+
+    TLSSocket server(TlsServerConfig{.tcp                 = {.port = TLS_PORT_MTLS_UNTRUSTED, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file           = server_leaf.cert_file,
+                                     .key_file            = server_leaf.key_file,
+                                     .ca_file             = trusted_ca.ca_cert_file,
+                                     .require_client_cert = true});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+
+    std::promise<bool> server_failed;
+    std::thread server_thread([&] {
+        auto r = server.accept();
+        server_failed.set_value(!r);
+    });
+
+    std::this_thread::sleep_for(50ms);
+
+    // See ServerRequiringClientCertRejectsAnonymousClient for why the client's
+    // connect() return value isn't asserted on (TLS 1.3 client-Finished races
+    // ahead of server cert validation). Server-side failure is the test.
+    TLSSocket client(TlsClientConfig{.tcp              = {.host = "127.0.0.1", .port = TLS_PORT_MTLS_UNTRUSTED, .connect_timeout = 1000ms},
+                                     .verify_peer      = false,
+                                     .verify_hostname  = false,
+                                     .client_cert_file = rogue_client.cert_file,
+                                     .client_key_file  = rogue_client.key_file});
+    (void)client.connect();
+
+    server_thread.join();
+    EXPECT_TRUE(server_failed.get_future().get());
+}
+
+TEST_F(TLSSocketTest, ServerWithoutRequireClientCertIgnoresClientCert) {
+    // require_client_cert defaults to false. Even when the client tries to
+    // present a cert, the server doesn't send a CertificateRequest, so the
+    // client cert is never sent and peer_cert_subject() on the server is empty.
+    CertAuthority ca;
+    auto server_leaf = ca.issue_leaf("localhost", true);
+    auto client_leaf = ca.issue_leaf("uninvited-client", false);
+
+    TLSSocket server(TlsServerConfig{.tcp       = {.port = TLS_PORT_MTLS_OPTIONAL, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file = server_leaf.cert_file,
+                                     .key_file  = server_leaf.key_file});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+
+    std::promise<std::string> server_peer_subject;
+    auto server_thread = spawn_loopback_server(server, [&](TLSSocket& peer) {
+        server_peer_subject.set_value(std::string{peer.peer_cert_subject()});
+        std::vector<std::byte> buf(16);
+        (void)peer.recv(buf);
+    });
+
+    std::this_thread::sleep_for(50ms);
+
+    TLSSocket client(TlsClientConfig{.tcp              = {.host = "127.0.0.1", .port = TLS_PORT_MTLS_OPTIONAL, .connect_timeout = 1000ms},
+                                     .verify_peer      = false,
+                                     .verify_hostname  = false,
+                                     .client_cert_file = client_leaf.cert_file,
+                                     .client_key_file  = client_leaf.key_file});
+    ASSERT_TRUE(client.connect()) << client.handshake_error();
+
+    client.close();
+    server_thread.join();
+    EXPECT_TRUE(server_peer_subject.get_future().get().empty());
+}
+
+// ---------------------------------------------------------------------------
 // Wire log (Debug builds / SAP_TLS_WIRE_LOGGING)
 // ---------------------------------------------------------------------------
 
@@ -731,10 +1050,9 @@ TEST_F(TLSSocketTest, ConceptSubstitutability) {
 TEST_F(TLSSocketTest, WireLogReceivesPlaintextOnSendAndRecv) {
     SelfSignedCert cert;
 
-    TLSSocket server({.tcp              = {.port = TLS_PORT_WIRELOG, .listen_backlog = 1, .reuse_addr = true},
-                      .role             = ETlsRole::Server,
-                      .server_cert_file = cert.cert_file,
-                      .server_key_file  = cert.key_file});
+    TLSSocket server(TlsServerConfig{.tcp       = {.port = TLS_PORT_WIRELOG, .listen_backlog = 1, .reuse_addr = true},
+                                     .cert_file = cert.cert_file,
+                                     .key_file  = cert.key_file});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -753,12 +1071,12 @@ TEST_F(TLSSocketTest, WireLogReceivesPlaintextOnSendAndRecv) {
     std::atomic<int> sent_calls{0};
     std::atomic<int> recv_calls{0};
 
-    TlsConfig client_cfg{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_WIRELOG},
-                         .verify_peer     = false,
-                         .verify_hostname = false};
-    client_cfg.wire_log = [&](TlsConfig::EWireDirection dir, stl::span<const std::byte> data) {
+    TlsClientConfig client_cfg{.tcp             = {.host = "127.0.0.1", .port = TLS_PORT_WIRELOG},
+                               .verify_peer     = false,
+                               .verify_hostname = false};
+    client_cfg.wire_log = [&](ETlsWireDirection dir, stl::span<const std::byte> data) {
         std::lock_guard lk(log_mu);
-        if (dir == TlsConfig::EWireDirection::Send) {
+        if (dir == ETlsWireDirection::Send) {
             ++sent_calls;
             sent_seen.insert(sent_seen.end(), data.begin(), data.end());
         } else {

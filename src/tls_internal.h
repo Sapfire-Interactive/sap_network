@@ -14,9 +14,12 @@ namespace sap::network::internal {
     // Always clears the thread's error queue.
     stl::string drain_ssl_errors();
 
-    // Resolve (or build) the shared SSL_CTX for this TlsConfig equivalence
+    // Resolve (or build) the shared SSL_CTX for the given config equivalence
     // class. Lifetimes managed by an internal cache; do not SSL_CTX_free.
-    SSL_CTX* acquire_ctx(const TlsConfig& cfg);
+    // Client and server contexts live in separate caches; the role is encoded
+    // in the choice of overload.
+    SSL_CTX* acquire_ctx(const TlsClientConfig& cfg);
+    SSL_CTX* acquire_ctx(const TlsServerConfig& cfg);
 
     // Windows trust-store import, defined in tls_trust_store_windows.cpp
     // (no-op implementation in tls_trust_store_posix.cpp). Returns number

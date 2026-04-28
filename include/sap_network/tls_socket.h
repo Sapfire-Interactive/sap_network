@@ -11,15 +11,27 @@
 #include <sap_core/types.h>
 
 #include <chrono>
+#include <variant>
 
 struct ssl_st;
 struct ssl_ctx_st;
 
 namespace sap::network {
 
+    // TLSSocket has three internal states encoded in the config variant:
+    //   - TlsClientConfig: an outbound socket. connect() is meaningful.
+    //   - TlsServerConfig: a listening socket. bind/listen/accept are meaningful.
+    //   - TlsAcceptedConfig: a server-side accepted connection (returned from
+    //     accept()). send/recv/close/introspection are meaningful.
+    // Calling a method against the wrong variant fails gracefully (connect()
+    // returns false with an error in handshake_error(); accept() returns an
+    // error result), but the type system steers callers to the right shape via
+    // the two public constructors.
     class TLSSocket {
     public:
-        explicit TLSSocket(TlsConfig config);
+        explicit TLSSocket(TlsClientConfig config);
+        explicit TLSSocket(TlsServerConfig config);
+
         ~TLSSocket();
         TLSSocket(const TLSSocket&) = delete;
         TLSSocket& operator=(const TLSSocket&) = delete;
@@ -27,17 +39,17 @@ namespace sap::network {
         TLSSocket& operator=(TLSSocket&&) noexcept;
 
         // Socket concept surface (mirrors TCPSocket's common methods).
-        bool connect(); // Client: TCP connect + SSL_connect + verify.
+        bool connect(); // Client-only: TCP connect + SSL_connect + verify.
         stl::result<size_t> send(stl::span<const stl::byte> data); // SSL_write.
         stl::result<size_t> recv(stl::span<stl::byte> data); // SSL_read; 0 = peer-closed.
         void close(); // SSL_shutdown → TCP close.
         bool valid() const;
-        const SocketConfig& config() const { return m_config.tcp; }
+        const SocketConfig& config() const;
 
         // Server-side additions (beyond the Socket concept).
-        bool bind(); // Delegates to m_tcp.
-        bool listen(); // Delegates to m_tcp.
-        stl::result<TLSSocket> accept(); // TCP accept + SSL_accept. Inherits server config.
+        bool bind();
+        bool listen();
+        stl::result<TLSSocket> accept(); // Server-only: TCP accept + SSL_accept.
 
         // Timeouts apply to the underlying TCP layer; TLS inherits them.
         void set_recv_timeout(std::chrono::milliseconds ms);
@@ -51,19 +63,24 @@ namespace sap::network {
         stl::string peer_cert_issuer() const;
 
         // Detail for the most recent connect()/accept() failure. Empty when
-        // the handshake succeeded or hasn't run. Populated from the OpenSSL
-        // error stack. send/recv errors live in their own result<>.
+        // the handshake succeeded or hasn't run.
         const stl::string& handshake_error() const { return m_handshake_error; }
 
     private:
-        // Private constructor used by accept() to wrap a freshly-accepted
-        // server-side TCP connection + its SSL*.
-        TLSSocket(TCPSocket tcp, ssl_st* ssl, TlsConfig config);
+        // Used by accept() to wrap a freshly-accepted server-side TCP
+        // connection + its SSL*.
+        TLSSocket(TCPSocket tcp, ssl_st* ssl, TlsAcceptedConfig config);
 
-        // Member declaration order is load-bearing: m_tcp's ctor reads
-        // m_config.tcp, so m_config MUST be declared (and therefore
-        // initialized) first.
-        TlsConfig m_config;
+    public:
+        // Public so free helpers in the .cpp can std::visit it without needing
+        // friend declarations. Not part of the user-facing API surface.
+        using ConfigVariant = std::variant<TlsClientConfig, TlsServerConfig, TlsAcceptedConfig>;
+
+    private:
+        // Member declaration order is load-bearing: m_tcp's ctor reads the
+        // tcp field of whichever variant is active, so m_config MUST be
+        // declared (and initialized) first.
+        ConfigVariant m_config;
         TCPSocket m_tcp;
         ssl_st* m_ssl = nullptr; // Opaque; defined by OpenSSL in tls_socket.cpp.
         stl::string m_handshake_error;

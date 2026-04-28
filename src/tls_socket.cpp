@@ -13,6 +13,16 @@ namespace sap::network {
 
     namespace {
 
+        const SocketConfig& tcp_of(const TLSSocket::ConfigVariant& v) {
+            return std::visit([](const auto& c) -> const SocketConfig& { return c.tcp; }, v);
+        }
+
+#ifdef SAP_TLS_WIRE_LOGGING
+        const TlsWireLogFn& wire_log_of(const TLSSocket::ConfigVariant& v) {
+            return std::visit([](const auto& c) -> const TlsWireLogFn& { return c.wire_log; }, v);
+        }
+#endif
+
         stl::string format_handshake_error(const char* stage, SSL* ssl) {
             long verify = ::SSL_get_verify_result(ssl);
             stl::string err = drain_ssl_errors();
@@ -25,9 +35,11 @@ namespace sap::network {
 
     } // namespace
 
-    TLSSocket::TLSSocket(TlsConfig config) : m_config(std::move(config)), m_tcp(m_config.tcp) {}
+    TLSSocket::TLSSocket(TlsClientConfig config) : m_config(std::move(config)), m_tcp(tcp_of(m_config)) {}
+    TLSSocket::TLSSocket(TlsServerConfig config) : m_config(std::move(config)), m_tcp(tcp_of(m_config)) {}
 
-    TLSSocket::TLSSocket(TCPSocket tcp, ssl_st* ssl, TlsConfig config) : m_config(std::move(config)), m_tcp(std::move(tcp)), m_ssl(ssl) {}
+    TLSSocket::TLSSocket(TCPSocket tcp, ssl_st* ssl, TlsAcceptedConfig config) :
+        m_config(std::move(config)), m_tcp(std::move(tcp)), m_ssl(ssl) {}
 
     TLSSocket::TLSSocket(TLSSocket&& other) noexcept :
         m_config(std::move(other.m_config)), m_tcp(std::move(other.m_tcp)), m_ssl(other.m_ssl),
@@ -50,6 +62,8 @@ namespace sap::network {
     TLSSocket::~TLSSocket() { close(); }
 
     bool TLSSocket::valid() const { return m_tcp.valid(); }
+
+    const SocketConfig& TLSSocket::config() const { return tcp_of(m_config); }
 
     void TLSSocket::close() {
         if (m_ssl != nullptr) {
@@ -83,7 +97,13 @@ namespace sap::network {
     bool TLSSocket::connect() {
         m_handshake_error.clear();
 
-        SSL_CTX* ctx = acquire_ctx(m_config);
+        const auto* cfg = std::get_if<TlsClientConfig>(&m_config);
+        if (cfg == nullptr) {
+            m_handshake_error = "TLSSocket::connect() called on non-client config";
+            return false;
+        }
+
+        SSL_CTX* ctx = acquire_ctx(*cfg);
         if (ctx == nullptr) {
             m_handshake_error = "SSL_CTX build failed: " + drain_ssl_errors();
             return false;
@@ -102,16 +122,16 @@ namespace sap::network {
 
         ::SSL_set_fd(m_ssl, static_cast<int>(m_tcp.native_handle()));
 
-        const stl::string& host = m_config.sni_hostname.empty() ? m_config.tcp.host : m_config.sni_hostname;
+        const stl::string& host = cfg->sni_hostname.empty() ? cfg->tcp.host : cfg->sni_hostname;
         if (!host.empty()) {
             ::SSL_set_tlsext_host_name(m_ssl, host.c_str());
-            if (m_config.verify_hostname)
+            if (cfg->verify_hostname)
                 ::SSL_set1_host(m_ssl, host.c_str());
         }
 
-        if (!m_config.alpn_protocols.empty()) {
+        if (!cfg->alpn_protocols.empty()) {
             stl::vector<unsigned char> wire;
-            for (const auto& p : m_config.alpn_protocols) {
+            for (const auto& p : cfg->alpn_protocols) {
                 wire.push_back(static_cast<unsigned char>(p.size()));
                 wire.insert(wire.end(), p.begin(), p.end());
             }
@@ -126,11 +146,15 @@ namespace sap::network {
     }
 
     stl::result<TLSSocket> TLSSocket::accept() {
+        const auto* cfg = std::get_if<TlsServerConfig>(&m_config);
+        if (cfg == nullptr)
+            return stl::make_error<TLSSocket>("TLSSocket::accept() called on non-server config");
+
         auto tcp_result = m_tcp.accept();
         if (!tcp_result)
             return stl::make_error<TLSSocket>("TCP accept failed: {}", tcp_result.error());
 
-        SSL_CTX* ctx = acquire_ctx(m_config);
+        SSL_CTX* ctx = acquire_ctx(*cfg);
         if (ctx == nullptr)
             return stl::make_error<TLSSocket>("SSL_CTX build failed: {}", drain_ssl_errors());
 
@@ -147,7 +171,13 @@ namespace sap::network {
             return stl::make_error<TLSSocket>("{}", err);
         }
 
-        return TLSSocket(std::move(accepted), ssl, m_config);
+        TlsAcceptedConfig accepted_cfg{
+            .tcp = cfg->tcp,
+#ifdef SAP_TLS_WIRE_LOGGING
+            .wire_log = cfg->wire_log,
+#endif
+        };
+        return TLSSocket(std::move(accepted), ssl, std::move(accepted_cfg));
     }
 
     stl::result<size_t> TLSSocket::send(stl::span<const stl::byte> data) {
@@ -163,8 +193,8 @@ namespace sap::network {
         }
 
 #ifdef SAP_TLS_WIRE_LOGGING
-        if (m_config.wire_log)
-            m_config.wire_log(TlsConfig::EWireDirection::Send, data.first(static_cast<size_t>(n)));
+        if (const auto& fn = wire_log_of(m_config))
+            fn(ETlsWireDirection::Send, data.first(static_cast<size_t>(n)));
 #endif
         return static_cast<size_t>(n);
     }
@@ -189,8 +219,8 @@ namespace sap::network {
         }
 
 #ifdef SAP_TLS_WIRE_LOGGING
-        if (m_config.wire_log)
-            m_config.wire_log(TlsConfig::EWireDirection::Recv, data.first(static_cast<size_t>(n)));
+        if (const auto& fn = wire_log_of(m_config))
+            fn(ETlsWireDirection::Recv, data.first(static_cast<size_t>(n)));
 #endif
         return static_cast<size_t>(n);
     }

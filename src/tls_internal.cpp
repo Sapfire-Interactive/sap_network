@@ -25,37 +25,119 @@ namespace sap::network::internal {
 
     namespace {
 
-        struct CtxKey {
-            ETlsRole role;
+        // ---- shared helpers ------------------------------------------------
+
+        void mix_hash(size_t& h, size_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        }
+
+        int min_proto_version_int(ETlsMinVersion v) {
+            return v == ETlsMinVersion::TLS_1_3 ? TLS1_3_VERSION : TLS1_2_VERSION;
+        }
+
+        // ---- client cache --------------------------------------------------
+
+        struct ClientCtxKey {
             bool verify_peer;
             bool verify_hostname;
             stl::string ca_file;
             stl::string ca_dir;
             stl::string client_cert_file;
             stl::string client_key_file;
-            stl::string server_cert_file;
-            stl::string server_key_file;
             stl::vector<stl::string> alpn;
-            TlsConfig::EMinVersion min_version;
+            ETlsMinVersion min_version;
 
-            bool operator==(const CtxKey&) const = default;
+            bool operator==(const ClientCtxKey&) const = default;
         };
 
-        struct CtxKeyHash {
-            size_t operator()(const CtxKey& k) const noexcept {
-                size_t h = std::hash<int>{}(static_cast<int>(k.role));
-                auto mix = [&](size_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
-                mix(std::hash<bool>{}(k.verify_peer));
-                mix(std::hash<bool>{}(k.verify_hostname));
-                mix(std::hash<stl::string>{}(k.ca_file));
-                mix(std::hash<stl::string>{}(k.ca_dir));
-                mix(std::hash<stl::string>{}(k.client_cert_file));
-                mix(std::hash<stl::string>{}(k.client_key_file));
-                mix(std::hash<stl::string>{}(k.server_cert_file));
-                mix(std::hash<stl::string>{}(k.server_key_file));
+        struct ClientCtxKeyHash {
+            size_t operator()(const ClientCtxKey& k) const noexcept {
+                size_t h = std::hash<bool>{}(k.verify_peer);
+                mix_hash(h, std::hash<bool>{}(k.verify_hostname));
+                mix_hash(h, std::hash<stl::string>{}(k.ca_file));
+                mix_hash(h, std::hash<stl::string>{}(k.ca_dir));
+                mix_hash(h, std::hash<stl::string>{}(k.client_cert_file));
+                mix_hash(h, std::hash<stl::string>{}(k.client_key_file));
                 for (const auto& p : k.alpn)
-                    mix(std::hash<stl::string>{}(p));
-                mix(std::hash<int>{}(static_cast<int>(k.min_version)));
+                    mix_hash(h, std::hash<stl::string>{}(p));
+                mix_hash(h, std::hash<int>{}(static_cast<int>(k.min_version)));
+                return h;
+            }
+        };
+
+        struct ClientCtxEntry {
+            SSL_CTX* ctx = nullptr;
+            ~ClientCtxEntry() {
+                if (ctx)
+                    ::SSL_CTX_free(ctx);
+            }
+        };
+
+        ClientCtxKey make_client_key(const TlsClientConfig& cfg) {
+            return {cfg.verify_peer,
+                    cfg.verify_hostname,
+                    cfg.ca_file,
+                    cfg.ca_dir,
+                    cfg.client_cert_file,
+                    cfg.client_key_file,
+                    cfg.alpn_protocols,
+                    cfg.min_version};
+        }
+
+        SSL_CTX* build_client_ctx(const TlsClientConfig& cfg) {
+            SSL_CTX* ctx = ::SSL_CTX_new(::TLS_client_method());
+            if (ctx == nullptr)
+                return nullptr;
+
+            ::SSL_CTX_set_min_proto_version(ctx, min_proto_version_int(cfg.min_version));
+            ::SSL_CTX_set_max_early_data(ctx, 0); // disable 0-RTT replay surface
+
+            ::SSL_CTX_set_verify(ctx, cfg.verify_peer ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, nullptr);
+
+            if (!cfg.ca_file.empty()) {
+                ::SSL_CTX_load_verify_locations(ctx, cfg.ca_file.c_str(), nullptr);
+            } else if (!cfg.ca_dir.empty()) {
+                ::SSL_CTX_load_verify_locations(ctx, nullptr, cfg.ca_dir.c_str());
+            } else {
+#ifdef _WIN32
+                load_system_trust_store(ctx);
+#else
+                ::SSL_CTX_set_default_verify_paths(ctx);
+#endif
+            }
+
+            if (!cfg.client_cert_file.empty() && !cfg.client_key_file.empty()) {
+                ::SSL_CTX_use_certificate_chain_file(ctx, cfg.client_cert_file.c_str());
+                ::SSL_CTX_use_PrivateKey_file(ctx, cfg.client_key_file.c_str(), SSL_FILETYPE_PEM);
+            }
+
+            return ctx;
+        }
+
+        // ---- server cache --------------------------------------------------
+
+        struct ServerCtxKey {
+            stl::string cert_file;
+            stl::string key_file;
+            stl::string ca_file;
+            stl::string ca_dir;
+            bool require_client_cert;
+            stl::vector<stl::string> alpn;
+            ETlsMinVersion min_version;
+
+            bool operator==(const ServerCtxKey&) const = default;
+        };
+
+        struct ServerCtxKeyHash {
+            size_t operator()(const ServerCtxKey& k) const noexcept {
+                size_t h = std::hash<stl::string>{}(k.cert_file);
+                mix_hash(h, std::hash<stl::string>{}(k.key_file));
+                mix_hash(h, std::hash<stl::string>{}(k.ca_file));
+                mix_hash(h, std::hash<stl::string>{}(k.ca_dir));
+                mix_hash(h, std::hash<bool>{}(k.require_client_cert));
+                for (const auto& p : k.alpn)
+                    mix_hash(h, std::hash<stl::string>{}(p));
+                mix_hash(h, std::hash<int>{}(static_cast<int>(k.min_version)));
                 return h;
             }
         };
@@ -63,25 +145,21 @@ namespace sap::network::internal {
         // Owns the SSL_CTX plus the alpn list in stable storage so the
         // server-side ALPN-select callback can reach the list via the
         // SSL_CTX_set_alpn_select_cb arg pointer.
-        struct CtxEntry {
+        struct ServerCtxEntry {
             SSL_CTX* ctx = nullptr;
             stl::vector<stl::string> alpn;
-            ~CtxEntry() {
+            ~ServerCtxEntry() {
                 if (ctx)
                     ::SSL_CTX_free(ctx);
             }
         };
 
-        CtxKey make_key(const TlsConfig& cfg) {
-            return {cfg.role,
-                    cfg.verify_peer,
-                    cfg.verify_hostname,
+        ServerCtxKey make_server_key(const TlsServerConfig& cfg) {
+            return {cfg.cert_file,
+                    cfg.key_file,
                     cfg.ca_file,
                     cfg.ca_dir,
-                    cfg.client_cert_file,
-                    cfg.client_key_file,
-                    cfg.server_cert_file,
-                    cfg.server_key_file,
+                    cfg.require_client_cert,
                     cfg.alpn_protocols,
                     cfg.min_version};
         }
@@ -105,72 +183,96 @@ namespace sap::network::internal {
             return SSL_TLSEXT_ERR_NOACK;
         }
 
-        SSL_CTX* build_ctx(const TlsConfig& cfg, CtxEntry& entry) {
-            const SSL_METHOD* method = (cfg.role == ETlsRole::Server) ? ::TLS_server_method() : ::TLS_client_method();
-            SSL_CTX* ctx = ::SSL_CTX_new(method);
+        SSL_CTX* build_server_ctx(const TlsServerConfig& cfg, ServerCtxEntry& entry) {
+            SSL_CTX* ctx = ::SSL_CTX_new(::TLS_server_method());
             if (ctx == nullptr)
                 return nullptr;
 
-            int min_version = (cfg.min_version == TlsConfig::EMinVersion::TLS_1_3) ? TLS1_3_VERSION : TLS1_2_VERSION;
-            ::SSL_CTX_set_min_proto_version(ctx, min_version);
+            ::SSL_CTX_set_min_proto_version(ctx, min_proto_version_int(cfg.min_version));
             ::SSL_CTX_set_max_early_data(ctx, 0); // disable 0-RTT replay surface
 
-            if (cfg.role == ETlsRole::Server) {
-                if (cfg.server_cert_file.empty() || cfg.server_key_file.empty()) {
+            if (cfg.cert_file.empty() || cfg.key_file.empty()) {
+                ::SSL_CTX_free(ctx);
+                return nullptr;
+            }
+            if (::SSL_CTX_use_certificate_chain_file(ctx, cfg.cert_file.c_str()) != 1 ||
+                ::SSL_CTX_use_PrivateKey_file(ctx, cfg.key_file.c_str(), SSL_FILETYPE_PEM) != 1 ||
+                ::SSL_CTX_check_private_key(ctx) != 1) {
+                ::SSL_CTX_free(ctx);
+                return nullptr;
+            }
+            if (!entry.alpn.empty())
+                ::SSL_CTX_set_alpn_select_cb(ctx, server_alpn_select_cb, &entry.alpn);
+
+            if (cfg.require_client_cert) {
+                // require_client_cert without trust roots is a misconfiguration
+                // — no client cert can ever verify. Fail fast at ctx-build time.
+                if (cfg.ca_file.empty() && cfg.ca_dir.empty()) {
                     ::SSL_CTX_free(ctx);
                     return nullptr;
                 }
-                if (::SSL_CTX_use_certificate_chain_file(ctx, cfg.server_cert_file.c_str()) != 1 ||
-                    ::SSL_CTX_use_PrivateKey_file(ctx, cfg.server_key_file.c_str(), SSL_FILETYPE_PEM) != 1 ||
-                    ::SSL_CTX_check_private_key(ctx) != 1) {
+                const char* ca_file = cfg.ca_file.empty() ? nullptr : cfg.ca_file.c_str();
+                const char* ca_dir  = cfg.ca_dir.empty() ? nullptr : cfg.ca_dir.c_str();
+                if (::SSL_CTX_load_verify_locations(ctx, ca_file, ca_dir) != 1) {
                     ::SSL_CTX_free(ctx);
                     return nullptr;
                 }
-                if (!entry.alpn.empty())
-                    ::SSL_CTX_set_alpn_select_cb(ctx, server_alpn_select_cb, &entry.alpn);
+                // Send CertificateRequest and reject if the client doesn't
+                // present a cert that verifies against the trust roots above.
+                ::SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+
+                // Tell the client which CA names we accept. Without this a
+                // client with multiple certs has to guess. Optional but free.
+                // SSL_CTX_set_client_CA_list takes ownership of `names`.
+                if (ca_file != nullptr) {
+                    if (STACK_OF(X509_NAME)* names = ::SSL_load_client_CA_file(ca_file))
+                        ::SSL_CTX_set_client_CA_list(ctx, names);
+                }
             } else {
-                ::SSL_CTX_set_verify(ctx, cfg.verify_peer ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, nullptr);
-
-                if (!cfg.ca_file.empty()) {
-                    ::SSL_CTX_load_verify_locations(ctx, cfg.ca_file.c_str(), nullptr);
-                } else if (!cfg.ca_dir.empty()) {
-                    ::SSL_CTX_load_verify_locations(ctx, nullptr, cfg.ca_dir.c_str());
-                } else {
-#ifdef _WIN32
-                    load_system_trust_store(ctx);
-#else
-                    ::SSL_CTX_set_default_verify_paths(ctx);
-#endif
-                }
-
-                if (!cfg.client_cert_file.empty() && !cfg.client_key_file.empty()) {
-                    ::SSL_CTX_use_certificate_chain_file(ctx, cfg.client_cert_file.c_str());
-                    ::SSL_CTX_use_PrivateKey_file(ctx, cfg.client_key_file.c_str(), SSL_FILETYPE_PEM);
-                }
+                ::SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
             }
 
             return ctx;
         }
 
+        // ---- caches --------------------------------------------------------
+
         stl::mutex g_mu;
-        stl::unordered_map<CtxKey, stl::unique_ptr<CtxEntry>, CtxKeyHash> g_cache;
+        stl::unordered_map<ClientCtxKey, stl::unique_ptr<ClientCtxEntry>, ClientCtxKeyHash> g_client_cache;
+        stl::unordered_map<ServerCtxKey, stl::unique_ptr<ServerCtxEntry>, ServerCtxKeyHash> g_server_cache;
 
     } // namespace
 
-    SSL_CTX* acquire_ctx(const TlsConfig& cfg) {
-        CtxKey key = make_key(cfg);
+    SSL_CTX* acquire_ctx(const TlsClientConfig& cfg) {
+        ClientCtxKey key = make_client_key(cfg);
         stl::lock_guard lock(g_mu);
-        if (auto it = g_cache.find(key); it != g_cache.end())
+        if (auto it = g_client_cache.find(key); it != g_client_cache.end())
             return it->second->ctx;
 
-        auto entry = stl::make_unique<CtxEntry>();
-        entry->alpn = cfg.alpn_protocols;
-        entry->ctx = build_ctx(cfg, *entry);
+        auto entry = stl::make_unique<ClientCtxEntry>();
+        entry->ctx = build_client_ctx(cfg);
         if (entry->ctx == nullptr)
             return nullptr;
 
         SSL_CTX* result = entry->ctx;
-        g_cache.emplace(std::move(key), std::move(entry));
+        g_client_cache.emplace(std::move(key), std::move(entry));
+        return result;
+    }
+
+    SSL_CTX* acquire_ctx(const TlsServerConfig& cfg) {
+        ServerCtxKey key = make_server_key(cfg);
+        stl::lock_guard lock(g_mu);
+        if (auto it = g_server_cache.find(key); it != g_server_cache.end())
+            return it->second->ctx;
+
+        auto entry = stl::make_unique<ServerCtxEntry>();
+        entry->alpn = cfg.alpn_protocols;
+        entry->ctx = build_server_ctx(cfg, *entry);
+        if (entry->ctx == nullptr)
+            return nullptr;
+
+        SSL_CTX* result = entry->ctx;
+        g_server_cache.emplace(std::move(key), std::move(entry));
         return result;
     }
 
