@@ -2,8 +2,8 @@
 
 #include <cstring>
 #include <sap_core/stl/string.h>
-#include <sap_core/stl/unordered_map.h>
 #include <sap_core/stl/unique_ptr.h>
+#include <sap_core/stl/unordered_map.h>
 #include <sap_core/types.h>
 
 #include <string>
@@ -27,13 +27,9 @@ namespace sap::network::internal {
 
         // ---- shared helpers ------------------------------------------------
 
-        void mix_hash(size_t& h, size_t v) {
-            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        }
+        void mix_hash(size_t& h, size_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); }
 
-        int min_proto_version_int(ETlsMinVersion v) {
-            return v == ETlsMinVersion::TLS_1_3 ? TLS1_3_VERSION : TLS1_2_VERSION;
-        }
+        int min_proto_version_int(ETlsMinVersion v) { return v == ETlsMinVersion::TLS_1_3 ? TLS1_3_VERSION : TLS1_2_VERSION; }
 
         // ---- client cache --------------------------------------------------
 
@@ -74,14 +70,8 @@ namespace sap::network::internal {
         };
 
         ClientCtxKey make_client_key(const TlsClientConfig& cfg) {
-            return {cfg.verify_peer,
-                    cfg.verify_hostname,
-                    cfg.ca_file,
-                    cfg.ca_dir,
-                    cfg.client_cert_file,
-                    cfg.client_key_file,
-                    cfg.alpn_protocols,
-                    cfg.min_version};
+            return {cfg.verify_peer,      cfg.verify_hostname, cfg.ca_file,        cfg.ca_dir,
+                    cfg.client_cert_file, cfg.client_key_file, cfg.alpn_protocols, cfg.min_version};
         }
 
         SSL_CTX* build_client_ctx(const TlsClientConfig& cfg) {
@@ -155,13 +145,7 @@ namespace sap::network::internal {
         };
 
         ServerCtxKey make_server_key(const TlsServerConfig& cfg) {
-            return {cfg.cert_file,
-                    cfg.key_file,
-                    cfg.ca_file,
-                    cfg.ca_dir,
-                    cfg.require_client_cert,
-                    cfg.alpn_protocols,
-                    cfg.min_version};
+            return {cfg.cert_file, cfg.key_file, cfg.ca_file, cfg.ca_dir, cfg.require_client_cert, cfg.alpn_protocols, cfg.min_version};
         }
 
         extern "C" int server_alpn_select_cb(SSL*, const unsigned char** out, unsigned char* outlen, const unsigned char* in,
@@ -196,8 +180,7 @@ namespace sap::network::internal {
                 return nullptr;
             }
             if (::SSL_CTX_use_certificate_chain_file(ctx, cfg.cert_file.c_str()) != 1 ||
-                ::SSL_CTX_use_PrivateKey_file(ctx, cfg.key_file.c_str(), SSL_FILETYPE_PEM) != 1 ||
-                ::SSL_CTX_check_private_key(ctx) != 1) {
+                ::SSL_CTX_use_PrivateKey_file(ctx, cfg.key_file.c_str(), SSL_FILETYPE_PEM) != 1 || ::SSL_CTX_check_private_key(ctx) != 1) {
                 ::SSL_CTX_free(ctx);
                 return nullptr;
             }
@@ -205,6 +188,11 @@ namespace sap::network::internal {
                 ::SSL_CTX_set_alpn_select_cb(ctx, server_alpn_select_cb, &entry.alpn);
 
             if (cfg.require_client_cert) {
+                // TLS 1.3 delivers the rejection alert after SSL_connect returns on the
+                // client side. Cap at TLS 1.2 so rejection is synchronous.
+                // TODO: OpenSSL supports SSL_verify_client_post_handshake() / SSL_CTX_set_post_handshake_auth() for proper TLS 1.3 client authentication
+                // Implement this when TLS 1.3 becomes a requirement.
+                ::SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
                 // require_client_cert without trust roots is a misconfiguration
                 // — no client cert can ever verify. Fail fast at ctx-build time.
                 if (cfg.ca_file.empty() && cfg.ca_dir.empty()) {
@@ -212,7 +200,7 @@ namespace sap::network::internal {
                     return nullptr;
                 }
                 const char* ca_file = cfg.ca_file.empty() ? nullptr : cfg.ca_file.c_str();
-                const char* ca_dir  = cfg.ca_dir.empty() ? nullptr : cfg.ca_dir.c_str();
+                const char* ca_dir = cfg.ca_dir.empty() ? nullptr : cfg.ca_dir.c_str();
                 if (::SSL_CTX_load_verify_locations(ctx, ca_file, ca_dir) != 1) {
                     ::SSL_CTX_free(ctx);
                     return nullptr;
