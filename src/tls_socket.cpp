@@ -1,6 +1,7 @@
 #include "sap_network/tls_socket.h"
 
 #include "tls_internal.h"
+#include "socket_internal.h"
 
 #include <cstring>
 #include <format>
@@ -64,6 +65,16 @@ namespace sap::network {
     bool TLSSocket::valid() const { return m_tcp.valid(); }
 
     const SocketConfig& TLSSocket::config() const { return tcp_of(m_config); }
+
+    void TLSSocket::interrupt_blocking_io() {
+        // Shut down only the read side. The kernel wakes any thread blocked in
+        // recv()/SSL_read() and makes it return 0 (EOF). Leaving the write side
+        // intact means close(), which the owning thread calls next, can still
+        // send a TLS close_notify without SIGPIPE.
+        SocketHandle fd = m_tcp.native_handle();
+        if (fd >= 0)
+            internal::shutdown_rd(fd);
+    }
 
     void TLSSocket::close() {
         if (m_ssl != nullptr) {

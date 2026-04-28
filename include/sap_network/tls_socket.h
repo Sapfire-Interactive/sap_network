@@ -42,6 +42,7 @@ namespace sap::network {
         bool connect(); // Client-only: TCP connect + SSL_connect + verify.
         stl::result<size_t> send(stl::span<const stl::byte> data); // SSL_write.
         stl::result<size_t> recv(stl::span<stl::byte> data); // SSL_read; 0 = peer-closed.
+        void interrupt_blocking_io();
         void close(); // SSL_shutdown → TCP close.
         bool valid() const;
         const SocketConfig& config() const;

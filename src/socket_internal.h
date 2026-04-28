@@ -60,6 +60,26 @@ namespace sap::network::internal {
 #endif
     }
 
+    inline void shutdown(SocketHandle h) {
+#ifdef _WIN32
+        ::shutdown(h, SD_BOTH);
+#else
+        ::shutdown(h, SHUT_RDWR);
+#endif
+    }
+
+    // Shut down only the read side. Wakes a thread blocked in recv()/SSL_read()
+    // (the kernel delivers SOCK_WAKE_WAITD and the blocking recv returns 0),
+    // while leaving the write side intact so SSL_shutdown can still send a
+    // close_notify without raising SIGPIPE.
+    inline void shutdown_rd(SocketHandle h) {
+#ifdef _WIN32
+        ::shutdown(h, SD_RECEIVE);
+#else
+        ::shutdown(h, SHUT_RD);
+#endif
+    }
+
     inline std::string error_message(int err) {
 #ifdef _WIN32
         char buf[256]{};
