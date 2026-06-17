@@ -43,10 +43,9 @@ target_compile_definitions(sap_network_lib
         $<$<OR:$<CONFIG:Debug>,$<BOOL:${SAP_TLS_WIRE_LOGGING}>>:SAP_TLS_WIRE_LOGGING>
 )
 
-target_link_libraries(sap_network_lib 
-    PUBLIC 
+target_link_libraries(sap_network_lib
+    PUBLIC
     sap::core
-    PRIVATE
     OpenSSL::SSL
     OpenSSL::Crypto
 )
@@ -60,13 +59,25 @@ if(SAP_NETWORK_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-install(TARGETS sap_network_lib
-    EXPORT sap_network_targets
-    RUNTIME DESTINATION bin
-)
+option(SAP_NETWORK_INSTALL "Should install?" Off)
+if(SAP_NETWORK_INSTALL)
+    include(GNUInstallDirs)
+    include(CMakePackageConfigHelpers)
 
-install(EXPORT sap_network_targets
-    FILE sap_network_targets.cmake
-    NAMESPACE sap::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/sap_network
-)
+    install(TARGETS sap_network_lib
+        EXPORT sap_network_targets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+
+    install(EXPORT sap_network_targets
+        FILE sap_network_targets.cmake
+        NAMESPACE sap::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/sap_network
+    )
+endif()
