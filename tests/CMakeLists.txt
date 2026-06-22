@@ -11,6 +11,7 @@ FetchContent_MakeAvailable(googletest)
 
 add_executable(sap_network_tests
     test_tcp_socket.cpp
+    test_tcp_socket_async.cpp
     test_udp_socket.cpp
     test_tls_socket.cpp
 )

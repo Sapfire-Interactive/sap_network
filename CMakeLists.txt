@@ -15,6 +15,7 @@ endif()
 add_library(sap_network_lib STATIC
     src/platform.cpp
     src/tcp_socket.cpp
+    src/tcp_socket_async.cpp
     src/udp_socket.cpp
     src/tls_socket.cpp
     src/tls_internal.cpp
