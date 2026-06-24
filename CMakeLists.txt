@@ -18,6 +18,7 @@ add_library(sap_network_lib STATIC
     src/tcp_socket_async.cpp
     src/udp_socket.cpp
     src/tls_socket.cpp
+    src/tls_socket_async.cpp
     src/tls_internal.cpp
     $<$<PLATFORM_ID:Linux>:src/tls_trust_store_posix.cpp>
     $<$<PLATFORM_ID:Windows>:src/tls_trust_store_windows.cpp>

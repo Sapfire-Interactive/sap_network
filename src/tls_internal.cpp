@@ -1,9 +1,11 @@
 #include "tls_internal.h"
 
 #include <cstring>
+#include <format>
 #include <sap_core/stl/string.h>
 #include <sap_core/stl/unique_ptr.h>
 #include <sap_core/stl/unordered_map.h>
+#include <sap_core/stl/vector.h>
 #include <sap_core/types.h>
 
 #include <string>
@@ -262,6 +264,36 @@ namespace sap::network::internal {
         SSL_CTX* result = entry->ctx;
         g_server_cache.emplace(std::move(key), std::move(entry));
         return result;
+    }
+
+    void setup_client_ssl(SSL* ssl, const TlsClientConfig& cfg, SocketHandle fd) {
+        ::SSL_set_fd(ssl, static_cast<int>(fd));
+
+        const stl::string& host = cfg.sni_hostname.empty() ? cfg.tcp.host : cfg.sni_hostname;
+        if (!host.empty()) {
+            ::SSL_set_tlsext_host_name(ssl, host.c_str());
+            if (cfg.verify_hostname)
+                ::SSL_set1_host(ssl, host.c_str());
+        }
+
+        if (!cfg.alpn_protocols.empty()) {
+            stl::vector<unsigned char> wire;
+            for (const auto& p : cfg.alpn_protocols) {
+                wire.push_back(static_cast<unsigned char>(p.size()));
+                wire.insert(wire.end(), p.begin(), p.end());
+            }
+            ::SSL_set_alpn_protos(ssl, wire.data(), static_cast<unsigned int>(wire.size()));
+        }
+    }
+
+    stl::string format_handshake_error(const char* stage, SSL* ssl) {
+        long        verify = ::SSL_get_verify_result(ssl);
+        stl::string err    = drain_ssl_errors();
+        if (verify != X509_V_OK) {
+            const char* reason = ::X509_verify_cert_error_string(verify);
+            return std::format("{} failed (verify {}: {}): {}", stage, verify, reason, err);
+        }
+        return std::format("{} failed: {}", stage, err);
     }
 
 } // namespace sap::network::internal

@@ -1,12 +1,13 @@
 #pragma once
 
+#include "sap_network/platform.h"
+#include "sap_network/tls_socket.h"
+
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
 #include <sap_core/stl/string.h>
-
-#include "sap_network/tls_socket.h"
 
 namespace sap::network::internal {
 
@@ -26,4 +27,13 @@ namespace sap::network::internal {
     // of certs added.
     int load_system_trust_store(SSL_CTX* ctx);
 
+    // Wires fd, SNI, ALPN, and hostname verification on a freshly-created
+    // client SSL*. Caller still drives SSL_connect.
+    void setup_client_ssl(SSL* ssl, const TlsClientConfig& cfg, SocketHandle fd);
+
+    // Pulls verify result + error stack into a human-readable message for
+    // failed SSL_connect / SSL_accept calls.
+    stl::string format_handshake_error(const char* stage, SSL* ssl);
+
 } // namespace sap::network::internal
+

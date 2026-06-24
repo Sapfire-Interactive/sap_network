@@ -4,13 +4,13 @@
 #include "socket_internal.h"
 
 #include <cstring>
-#include <format>
 #include <utility>
 
 namespace sap::network {
 
     using internal::acquire_ctx;
     using internal::drain_ssl_errors;
+    using internal::format_handshake_error;
 
     namespace {
 
@@ -23,16 +23,6 @@ namespace sap::network {
             return std::visit([](const auto& c) -> const TlsWireLogFn& { return c.wire_log; }, v);
         }
 #endif
-
-        stl::string format_handshake_error(const char* stage, SSL* ssl) {
-            long verify = ::SSL_get_verify_result(ssl);
-            stl::string err = drain_ssl_errors();
-            if (verify != X509_V_OK) {
-                const char* reason = ::X509_verify_cert_error_string(verify);
-                return std::format("{} failed (verify {}: {}): {}", stage, verify, reason, err);
-            }
-            return std::format("{} failed: {}", stage, err);
-        }
 
     } // namespace
 
@@ -131,23 +121,7 @@ namespace sap::network {
             return false;
         }
 
-        ::SSL_set_fd(m_ssl, static_cast<int>(m_tcp.native_handle()));
-
-        const stl::string& host = cfg->sni_hostname.empty() ? cfg->tcp.host : cfg->sni_hostname;
-        if (!host.empty()) {
-            ::SSL_set_tlsext_host_name(m_ssl, host.c_str());
-            if (cfg->verify_hostname)
-                ::SSL_set1_host(m_ssl, host.c_str());
-        }
-
-        if (!cfg->alpn_protocols.empty()) {
-            stl::vector<unsigned char> wire;
-            for (const auto& p : cfg->alpn_protocols) {
-                wire.push_back(static_cast<unsigned char>(p.size()));
-                wire.insert(wire.end(), p.begin(), p.end());
-            }
-            ::SSL_set_alpn_protos(m_ssl, wire.data(), static_cast<unsigned int>(wire.size()));
-        }
+        internal::setup_client_ssl(m_ssl, *cfg, m_tcp.native_handle());
 
         if (::SSL_connect(m_ssl) != 1) {
             m_handshake_error = format_handshake_error("SSL_connect", m_ssl);
