@@ -4,6 +4,7 @@
 
 #include <sap_core/async/executor.h>
 #include <sap_core/async/stop_token.h>
+#include <sap_core/stl/atomic.h>
 #include <sap_core/stl/utility.h>
 
 #include <string>
@@ -18,6 +19,11 @@ namespace sap::network {
     using internal::would_block;
 
     namespace {
+
+        struct op_lock_releaser {
+            stl::atomic<bool>* f;
+            ~op_lock_releaser() noexcept { f->store(false, std::memory_order_release); }
+        };
 
         SocketHandle create_socket_nonblocking() {
             SocketHandle h = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -42,6 +48,7 @@ namespace sap::network {
 
     TCPSocketAsync::TCPSocketAsync(TCPSocketAsync&& o) noexcept
         : m_ex(o.m_ex), m_handle(o.m_handle), m_config(stl::move(o.m_config)) {
+        m_op_in_flight.store(o.m_op_in_flight.load(std::memory_order_relaxed), std::memory_order_relaxed);
         o.m_handle = INVALID_SOCKET_HANDLE;
     }
 
@@ -49,9 +56,10 @@ namespace sap::network {
         if (this == &o)
             return *this;
         close();
-        m_ex       = o.m_ex;
-        m_handle   = o.m_handle;
-        m_config   = stl::move(o.m_config);
+        m_ex     = o.m_ex;
+        m_handle = o.m_handle;
+        m_config = stl::move(o.m_config);
+        m_op_in_flight.store(o.m_op_in_flight.load(std::memory_order_relaxed), std::memory_order_relaxed);
         o.m_handle = INVALID_SOCKET_HANDLE;
         return *this;
     }
@@ -94,6 +102,9 @@ namespace sap::network {
     sap::async::Task<stl::result<>> TCPSocketAsync::connect(sap::async::StopToken tok) {
         if (m_handle == INVALID_SOCKET_HANDLE)
             co_return stl::make_error<>("socket not valid");
+        if (m_op_in_flight.exchange(true, std::memory_order_acquire))
+            co_return stl::make_error<>("operation already in flight");
+        op_lock_releaser releaser{&m_op_in_flight};
 
         std::string port_str = std::to_string(m_config.port);
         addrinfo    hints{};
@@ -109,13 +120,16 @@ namespace sap::network {
 
         if (rc == 0)
             co_return stl::result<>{};
-
         if (!would_block(err))
             co_return stl::make_error<>("connect: {}", error_message(err));
 
-        {
+        try {
             sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, stl::move(tok));
             co_await awaiter;
+        } catch (const sap::async::CancelledError&) {
+            co_return stl::make_error<>("connect cancelled");
+        } catch (const sap::async::ReactorError& e) {
+            co_return stl::make_error<>("connect: reactor: {}", e.what());
         }
 
         int       so_err = 0;
@@ -123,61 +137,87 @@ namespace sap::network {
         ::getsockopt(m_handle, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &so_len);
         if (so_err != 0)
             co_return stl::make_error<>("connect: {}", error_message(so_err));
-
         co_return stl::result<>{};
     }
 
     sap::async::Task<stl::result<TCPSocketAsync>> TCPSocketAsync::accept(sap::async::StopToken tok) {
         if (m_handle == INVALID_SOCKET_HANDLE)
             co_return stl::make_error<TCPSocketAsync>("socket not valid");
+        if (m_op_in_flight.exchange(true, std::memory_order_acquire))
+            co_return stl::make_error<TCPSocketAsync>("operation already in flight");
+        op_lock_releaser releaser{&m_op_in_flight};
 
-        for (;;) {
-            sockaddr_in  addr{};
-            socklen_t    len   = sizeof(addr);
-            SocketHandle child = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
-            if (child != INVALID_SOCKET_HANDLE)
-                co_return stl::result<TCPSocketAsync>{stl::success, TCPSocketAsync::adopt(*m_ex, child, m_config)};
+        try {
+            for (;;) {
+                sockaddr_in  addr{};
+                socklen_t    len   = sizeof(addr);
+                SocketHandle child = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
+                if (child != INVALID_SOCKET_HANDLE)
+                    co_return stl::result<TCPSocketAsync>{stl::success, TCPSocketAsync::adopt(*m_ex, child, m_config)};
 
-            int err = last_error();
-            if (!would_block(err))
-                co_return stl::make_error<TCPSocketAsync>("accept: {}", error_message(err));
+                int err = last_error();
+                if (!would_block(err))
+                    co_return stl::make_error<TCPSocketAsync>("accept: {}", error_message(err));
 
-            sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
-            co_await awaiter;
+                sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
+                co_await awaiter;
+            }
+        } catch (const sap::async::CancelledError&) {
+            co_return stl::make_error<TCPSocketAsync>("accept cancelled");
+        } catch (const sap::async::ReactorError& e) {
+            co_return stl::make_error<TCPSocketAsync>("accept: reactor: {}", e.what());
         }
     }
 
     sap::async::Task<stl::result<size_t>> TCPSocketAsync::read(stl::span<stl::byte> buf, sap::async::StopToken tok) {
         if (m_handle == INVALID_SOCKET_HANDLE)
             co_return stl::make_error<size_t>("socket not valid");
+        if (m_op_in_flight.exchange(true, std::memory_order_acquire))
+            co_return stl::make_error<size_t>("operation already in flight");
+        op_lock_releaser releaser{&m_op_in_flight};
 
-        for (;;) {
-            auto n = ::recv(m_handle, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
-            if (n >= 0)
-                co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
-            int err = last_error();
-            if (!would_block(err))
-                co_return stl::make_error<size_t>("recv: {}", error_message(err));
+        try {
+            for (;;) {
+                auto n = ::recv(m_handle, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
+                if (n >= 0)
+                    co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
+                int err = last_error();
+                if (!would_block(err))
+                    co_return stl::make_error<size_t>("recv: {}", error_message(err));
 
-            sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
-            co_await awaiter;
+                sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
+                co_await awaiter;
+            }
+        } catch (const sap::async::CancelledError&) {
+            co_return stl::make_error<size_t>("read cancelled");
+        } catch (const sap::async::ReactorError& e) {
+            co_return stl::make_error<size_t>("read: reactor: {}", e.what());
         }
     }
 
     sap::async::Task<stl::result<size_t>> TCPSocketAsync::write(stl::span<const stl::byte> buf, sap::async::StopToken tok) {
         if (m_handle == INVALID_SOCKET_HANDLE)
             co_return stl::make_error<size_t>("socket not valid");
+        if (m_op_in_flight.exchange(true, std::memory_order_acquire))
+            co_return stl::make_error<size_t>("operation already in flight");
+        op_lock_releaser releaser{&m_op_in_flight};
 
-        for (;;) {
-            auto n = ::send(m_handle, reinterpret_cast<const char*>(buf.data()), static_cast<int>(buf.size()), 0);
-            if (n >= 0)
-                co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
-            int err = last_error();
-            if (!would_block(err))
-                co_return stl::make_error<size_t>("send: {}", error_message(err));
+        try {
+            for (;;) {
+                auto n = ::send(m_handle, reinterpret_cast<const char*>(buf.data()), static_cast<int>(buf.size()), 0);
+                if (n >= 0)
+                    co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
+                int err = last_error();
+                if (!would_block(err))
+                    co_return stl::make_error<size_t>("send: {}", error_message(err));
 
-            sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, tok);
-            co_await awaiter;
+                sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, tok);
+                co_await awaiter;
+            }
+        } catch (const sap::async::CancelledError&) {
+            co_return stl::make_error<size_t>("write cancelled");
+        } catch (const sap::async::ReactorError& e) {
+            co_return stl::make_error<size_t>("write: reactor: {}", e.what());
         }
     }
 

@@ -7,6 +7,7 @@
 #include <sap_core/async/executor.h>
 #include <sap_core/async/stop_token.h>
 #include <sap_core/async/task.h>
+#include <sap_core/stl/atomic.h>
 #include <sap_core/stl/result.h>
 #include <sap_core/stl/span.h>
 #include <sap_core/stl/string.h>
@@ -50,6 +51,7 @@ namespace sap::network {
         sap::async::Executor* m_ex     = nullptr;
         SocketHandle          m_handle = INVALID_SOCKET_HANDLE;
         SocketConfig          m_config;
+        stl::atomic<bool>     m_op_in_flight{false};
     };
 
     static_assert(SocketAsync<TCPSocketAsync>);

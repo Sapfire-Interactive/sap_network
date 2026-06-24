@@ -23,7 +23,6 @@ using namespace sap::network;
 using namespace std::chrono_literals;
 using sap::async::CancelledError;
 using sap::async::Executor;
-using sap::async::ReactorError;
 using sap::async::sleep_for;
 using sap::async::spawn;
 using sap::async::SpawnHandle;
@@ -191,7 +190,7 @@ TEST_F(TCPSocketAsyncTest, ReadPeerClose) {
     EXPECT_TRUE(r.has_value());
 }
 
-TEST_F(TCPSocketAsyncTest, CancellableRead_ThrowsCancelled) {
+TEST_F(TCPSocketAsyncTest, CancellableRead_ReturnsError) {
     auto exr = Executor::create();
     auto& ex = exr.value();
 
@@ -215,14 +214,8 @@ TEST_F(TCPSocketAsyncTest, CancellableRead_ThrowsCancelled) {
         auto canceller = spawn(e, fire_stop_after(e, 30ms, read_cancel));
 
         std::byte buf[32];
-        bool      threw = false;
-        try {
-            auto r = co_await client.read(stl::span<stl::byte>(buf, sizeof(buf)), read_cancel.token());
-            (void)r;
-        } catch (const CancelledError&) {
-            threw = true;
-        }
-        EXPECT_TRUE(threw);
+        auto      r = co_await client.read(stl::span<stl::byte>(buf, sizeof(buf)), read_cancel.token());
+        EXPECT_FALSE(r.has_value());
 
         co_await stl::move(canceller);
         keep_alive.request_stop();
@@ -301,14 +294,8 @@ TEST_F(TCPSocketAsyncTest, AcceptCancellable) {
         auto       listener  = make_listener(e, PORT_CANCEL_ACCEPT);
         auto       canceller = spawn(e, fire_stop_after(e, 30ms, src));
 
-        bool threw = false;
-        try {
-            auto r = co_await listener.accept(src.token());
-            (void)r;
-        } catch (const CancelledError&) {
-            threw = true;
-        }
-        EXPECT_TRUE(threw);
+        auto r = co_await listener.accept(src.token());
+        EXPECT_FALSE(r.has_value());
         co_await stl::move(canceller);
         co_return stl::result<>{};
     }(ex);
@@ -317,7 +304,7 @@ TEST_F(TCPSocketAsyncTest, AcceptCancellable) {
     sync_wait(stl::move(h));
 }
 
-TEST_F(TCPSocketAsyncTest, SecondConcurrentOp_ThrowsReactorError) {
+TEST_F(TCPSocketAsyncTest, SecondConcurrentOp_ReturnsError) {
     auto exr = Executor::create();
     auto& ex = exr.value();
 
@@ -343,20 +330,11 @@ TEST_F(TCPSocketAsyncTest, SecondConcurrentOp_ThrowsReactorError) {
         co_await sleep_for(e, 10ms);
 
         std::byte buf2[32];
-        bool      threw = false;
-        try {
-            auto r = co_await client.read(stl::span<stl::byte>(buf2, sizeof(buf2)));
-            (void)r;
-        } catch (const ReactorError&) {
-            threw = true;
-        }
-        EXPECT_TRUE(threw);
+        auto      r = co_await client.read(stl::span<stl::byte>(buf2, sizeof(buf2)));
+        EXPECT_FALSE(r.has_value());
 
         cancel_first.request_stop();
-        try {
-            (void)co_await stl::move(first);
-        } catch (const CancelledError&) {
-        }
+        (void)co_await stl::move(first);
 
         keep_alive.request_stop();
         co_await stl::move(server);
