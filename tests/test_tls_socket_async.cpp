@@ -120,16 +120,16 @@ namespace {
         return cfg;
     }
 
-    Task<void> fire_stop_after(Executor& ex, std::chrono::milliseconds dt, StopSource& src) {
-        co_await sleep_for(ex, dt);
+    Task<stl::result<>> fire_stop_after(Executor& ex, std::chrono::milliseconds dt, StopSource& src) {
+        if (auto r = co_await sleep_for(ex, dt); !r)
+            co_return r;
         src.request_stop();
+        co_return stl::success;
     }
 
     Task<stl::result<>> hold_until_stopped(Executor& ex, TLSSocketAsync /*sock*/, StopToken tok) {
-        try {
-            co_await sleep_for(ex, 1h, tok);
-        } catch (const sap::async::CancelledError&) {
-        }
+        if (auto r = co_await sleep_for(ex, 1h, tok); !r && !tok.stop_requested())
+            co_return r;
         co_return stl::result<>{};
     }
 
@@ -324,7 +324,8 @@ TEST_F(TLSSocketAsyncTest, SecondConcurrentOp_ReturnsError) {
         StopSource cancel_first;
         std::byte  buf1[32];
         auto       first = spawn(e, client.read(stl::span<stl::byte>(buf1, sizeof(buf1)), cancel_first.token()));
-        co_await sleep_for(e, 10ms);
+        if (auto r = co_await sleep_for(e, 10ms); !r)
+            co_return stl::make_error<>("sleep_for: {}", r.error());
 
         std::byte buf2[32];
         auto      r = co_await client.read(stl::span<stl::byte>(buf2, sizeof(buf2)));

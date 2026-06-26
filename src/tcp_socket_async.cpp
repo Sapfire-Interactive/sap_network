@@ -123,14 +123,9 @@ namespace sap::network {
         if (!would_block(err))
             co_return stl::make_error<>("connect: {}", error_message(err));
 
-        try {
-            sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, stl::move(tok));
-            co_await awaiter;
-        } catch (const sap::async::CancelledError&) {
-            co_return stl::make_error<>("connect cancelled");
-        } catch (const sap::async::ReactorError& e) {
-            co_return stl::make_error<>("connect: reactor: {}", e.what());
-        }
+        sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, stl::move(tok));
+        if (auto r = co_await awaiter; !r)
+            co_return stl::make_error<>("connect: {}", r.error());
 
         int       so_err = 0;
         socklen_t so_len = sizeof(so_err);
@@ -147,25 +142,20 @@ namespace sap::network {
             co_return stl::make_error<TCPSocketAsync>("operation already in flight");
         op_lock_releaser releaser{&m_op_in_flight};
 
-        try {
-            for (;;) {
-                sockaddr_in  addr{};
-                socklen_t    len   = sizeof(addr);
-                SocketHandle child = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
-                if (child != INVALID_SOCKET_HANDLE)
-                    co_return stl::result<TCPSocketAsync>{stl::success, TCPSocketAsync::adopt(*m_ex, child, m_config)};
+        for (;;) {
+            sockaddr_in  addr{};
+            socklen_t    len   = sizeof(addr);
+            SocketHandle child = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
+            if (child != INVALID_SOCKET_HANDLE)
+                co_return stl::result<TCPSocketAsync>{stl::success, TCPSocketAsync::adopt(*m_ex, child, m_config)};
 
-                int err = last_error();
-                if (!would_block(err))
-                    co_return stl::make_error<TCPSocketAsync>("accept: {}", error_message(err));
+            int err = last_error();
+            if (!would_block(err))
+                co_return stl::make_error<TCPSocketAsync>("accept: {}", error_message(err));
 
-                sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
-                co_await awaiter;
-            }
-        } catch (const sap::async::CancelledError&) {
-            co_return stl::make_error<TCPSocketAsync>("accept cancelled");
-        } catch (const sap::async::ReactorError& e) {
-            co_return stl::make_error<TCPSocketAsync>("accept: reactor: {}", e.what());
+            sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
+            if (auto r = co_await awaiter; !r)
+                co_return stl::make_error<TCPSocketAsync>("accept: {}", r.error());
         }
     }
 
@@ -176,22 +166,17 @@ namespace sap::network {
             co_return stl::make_error<size_t>("operation already in flight");
         op_lock_releaser releaser{&m_op_in_flight};
 
-        try {
-            for (;;) {
-                auto n = ::recv(m_handle, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
-                if (n >= 0)
-                    co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
-                int err = last_error();
-                if (!would_block(err))
-                    co_return stl::make_error<size_t>("recv: {}", error_message(err));
+        for (;;) {
+            auto n = ::recv(m_handle, reinterpret_cast<char*>(buf.data()), static_cast<int>(buf.size()), 0);
+            if (n >= 0)
+                co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
+            int err = last_error();
+            if (!would_block(err))
+                co_return stl::make_error<size_t>("recv: {}", error_message(err));
 
-                sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
-                co_await awaiter;
-            }
-        } catch (const sap::async::CancelledError&) {
-            co_return stl::make_error<size_t>("read cancelled");
-        } catch (const sap::async::ReactorError& e) {
-            co_return stl::make_error<size_t>("read: reactor: {}", e.what());
+            sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
+            if (auto r = co_await awaiter; !r)
+                co_return stl::make_error<size_t>("read: {}", r.error());
         }
     }
 
@@ -202,22 +187,17 @@ namespace sap::network {
             co_return stl::make_error<size_t>("operation already in flight");
         op_lock_releaser releaser{&m_op_in_flight};
 
-        try {
-            for (;;) {
-                auto n = ::send(m_handle, reinterpret_cast<const char*>(buf.data()), static_cast<int>(buf.size()), 0);
-                if (n >= 0)
-                    co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
-                int err = last_error();
-                if (!would_block(err))
-                    co_return stl::make_error<size_t>("send: {}", error_message(err));
+        for (;;) {
+            auto n = ::send(m_handle, reinterpret_cast<const char*>(buf.data()), static_cast<int>(buf.size()), 0);
+            if (n >= 0)
+                co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
+            int err = last_error();
+            if (!would_block(err))
+                co_return stl::make_error<size_t>("send: {}", error_message(err));
 
-                sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, tok);
-                co_await awaiter;
-            }
-        } catch (const sap::async::CancelledError&) {
-            co_return stl::make_error<size_t>("write cancelled");
-        } catch (const sap::async::ReactorError& e) {
-            co_return stl::make_error<size_t>("write: reactor: {}", e.what());
+            sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, tok);
+            if (auto r = co_await awaiter; !r)
+                co_return stl::make_error<size_t>("write: {}", r.error());
         }
     }
 

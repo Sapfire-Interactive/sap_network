@@ -148,50 +148,44 @@ namespace sap::network {
         int tcp_err = (tcp_rc < 0) ? last_error() : 0;
         ::freeaddrinfo(res);
 
-        try {
-            if (tcp_rc != 0) {
-                if (!would_block(tcp_err))
-                    co_return stl::make_error<>("tcp connect: {}", error_message(tcp_err));
-                sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, tok);
-                co_await awaiter;
-                int       so_err = 0;
-                socklen_t so_len = sizeof(so_err);
-                ::getsockopt(m_handle, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &so_len);
-                if (so_err != 0)
-                    co_return stl::make_error<>("tcp connect: {}", error_message(so_err));
+        if (tcp_rc != 0) {
+            if (!would_block(tcp_err))
+                co_return stl::make_error<>("tcp connect: {}", error_message(tcp_err));
+            sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, tok);
+            if (auto r = co_await awaiter; !r) {
+                m_handshake_error = std::format("tcp connect: {}", r.error().c_str());
+                co_return stl::make_error<>("tcp connect: {}", r.error());
             }
+            int       so_err = 0;
+            socklen_t so_len = sizeof(so_err);
+            ::getsockopt(m_handle, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &so_len);
+            if (so_err != 0)
+                co_return stl::make_error<>("tcp connect: {}", error_message(so_err));
+        }
 
-            m_ssl = ::SSL_new(ctx);
-            if (m_ssl == nullptr) {
-                m_handshake_error = "SSL_new failed: " + drain_ssl_errors();
-                co_return stl::make_error<>("{}", m_handshake_error);
-            }
-            setup_client_ssl(m_ssl, *cfg, m_handle);
+        m_ssl = ::SSL_new(ctx);
+        if (m_ssl == nullptr) {
+            m_handshake_error = "SSL_new failed: " + drain_ssl_errors();
+            co_return stl::make_error<>("{}", m_handshake_error);
+        }
+        setup_client_ssl(m_ssl, *cfg, m_handle);
 
-            for (;;) {
-                int rc = ::SSL_connect(m_ssl);
-                if (rc == 1)
-                    co_return stl::result<>{};
-                int sslerr = ::SSL_get_error(m_ssl, rc);
-                if (sslerr == SSL_ERROR_WANT_READ) {
-                    sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
-                    co_await awaiter;
-                    continue;
+        for (;;) {
+            int rc = ::SSL_connect(m_ssl);
+            if (rc == 1)
+                co_return stl::result<>{};
+            int sslerr = ::SSL_get_error(m_ssl, rc);
+            if (sslerr == SSL_ERROR_WANT_READ || sslerr == SSL_ERROR_WANT_WRITE) {
+                auto interest = (sslerr == SSL_ERROR_WANT_READ) ? sap::io::Event::Readable : sap::io::Event::Writable;
+                sap::async::IoAwaiter awaiter(*m_ex, m_handle, interest, tok);
+                if (auto r = co_await awaiter; !r) {
+                    m_handshake_error = std::format("SSL_connect: {}", r.error().c_str());
+                    co_return stl::make_error<>("SSL_connect: {}", r.error());
                 }
-                if (sslerr == SSL_ERROR_WANT_WRITE) {
-                    sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, tok);
-                    co_await awaiter;
-                    continue;
-                }
-                m_handshake_error = format_handshake_error("SSL_connect", m_ssl);
-                co_return stl::make_error<>("{}", m_handshake_error);
+                continue;
             }
-        } catch (const sap::async::CancelledError&) {
-            m_handshake_error = "connect cancelled";
-            co_return stl::make_error<>("connect cancelled");
-        } catch (const sap::async::ReactorError& e) {
-            m_handshake_error = std::format("connect: reactor: {}", e.what());
-            co_return stl::make_error<>("connect: reactor: {}", e.what());
+            m_handshake_error = format_handshake_error("SSL_connect", m_ssl);
+            co_return stl::make_error<>("{}", m_handshake_error);
         }
     }
 
@@ -211,23 +205,18 @@ namespace sap::network {
             co_return stl::make_error<TLSSocketAsync>("SSL_CTX build failed: {}", drain_ssl_errors());
 
         SocketHandle child_fd = INVALID_SOCKET_HANDLE;
-        try {
-            for (;;) {
-                sockaddr_in addr{};
-                socklen_t   len = sizeof(addr);
-                child_fd        = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
-                if (child_fd != INVALID_SOCKET_HANDLE)
-                    break;
-                int err = last_error();
-                if (!would_block(err))
-                    co_return stl::make_error<TLSSocketAsync>("accept: {}", error_message(err));
-                sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
-                co_await awaiter;
-            }
-        } catch (const sap::async::CancelledError&) {
-            co_return stl::make_error<TLSSocketAsync>("accept cancelled");
-        } catch (const sap::async::ReactorError& e) {
-            co_return stl::make_error<TLSSocketAsync>("accept: reactor: {}", e.what());
+        for (;;) {
+            sockaddr_in addr{};
+            socklen_t   len = sizeof(addr);
+            child_fd        = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
+            if (child_fd != INVALID_SOCKET_HANDLE)
+                break;
+            int err = last_error();
+            if (!would_block(err))
+                co_return stl::make_error<TLSSocketAsync>("accept: {}", error_message(err));
+            sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
+            if (auto r = co_await awaiter; !r)
+                co_return stl::make_error<TLSSocketAsync>("accept: {}", r.error());
         }
 
         set_nonblocking(child_fd, true);
@@ -239,35 +228,25 @@ namespace sap::network {
         }
         ::SSL_set_fd(child_ssl, static_cast<int>(child_fd));
 
-        try {
-            for (;;) {
-                int rc = ::SSL_accept(child_ssl);
-                if (rc == 1)
-                    break;
-                int sslerr = ::SSL_get_error(child_ssl, rc);
-                if (sslerr == SSL_ERROR_WANT_READ) {
-                    sap::async::IoAwaiter awaiter(*m_ex, child_fd, sap::io::Event::Readable, tok);
-                    co_await awaiter;
-                    continue;
+        for (;;) {
+            int rc = ::SSL_accept(child_ssl);
+            if (rc == 1)
+                break;
+            int sslerr = ::SSL_get_error(child_ssl, rc);
+            if (sslerr == SSL_ERROR_WANT_READ || sslerr == SSL_ERROR_WANT_WRITE) {
+                auto interest = (sslerr == SSL_ERROR_WANT_READ) ? sap::io::Event::Readable : sap::io::Event::Writable;
+                sap::async::IoAwaiter awaiter(*m_ex, child_fd, interest, tok);
+                if (auto r = co_await awaiter; !r) {
+                    ::SSL_free(child_ssl);
+                    close_handle(child_fd);
+                    co_return stl::make_error<TLSSocketAsync>("SSL_accept: {}", r.error());
                 }
-                if (sslerr == SSL_ERROR_WANT_WRITE) {
-                    sap::async::IoAwaiter awaiter(*m_ex, child_fd, sap::io::Event::Writable, tok);
-                    co_await awaiter;
-                    continue;
-                }
-                stl::string err_msg = format_handshake_error("SSL_accept", child_ssl);
-                ::SSL_free(child_ssl);
-                close_handle(child_fd);
-                co_return stl::make_error<TLSSocketAsync>("{}", err_msg);
+                continue;
             }
-        } catch (const sap::async::CancelledError&) {
+            stl::string err_msg = format_handshake_error("SSL_accept", child_ssl);
             ::SSL_free(child_ssl);
             close_handle(child_fd);
-            co_return stl::make_error<TLSSocketAsync>("accept handshake cancelled");
-        } catch (const sap::async::ReactorError& e) {
-            ::SSL_free(child_ssl);
-            close_handle(child_fd);
-            co_return stl::make_error<TLSSocketAsync>("accept handshake: reactor: {}", e.what());
+            co_return stl::make_error<TLSSocketAsync>("{}", err_msg);
         }
 
         TlsAcceptedConfig accepted_cfg{
@@ -286,35 +265,26 @@ namespace sap::network {
             co_return stl::make_error<size_t>("operation already in flight");
         op_lock_releaser releaser{&m_op_in_flight};
 
-        try {
-            for (;;) {
-                int n = ::SSL_read(m_ssl, buf.data(), static_cast<int>(buf.size()));
-                if (n > 0)
-                    co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
+        for (;;) {
+            int n = ::SSL_read(m_ssl, buf.data(), static_cast<int>(buf.size()));
+            if (n > 0)
+                co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
 
-                int sslerr = ::SSL_get_error(m_ssl, n);
-                if (sslerr == SSL_ERROR_ZERO_RETURN)
-                    co_return stl::result<size_t>{stl::success, static_cast<size_t>(0)};
-                if (sslerr == SSL_ERROR_SYSCALL && n == 0) {
-                    ::ERR_clear_error();
-                    co_return stl::result<size_t>{stl::success, static_cast<size_t>(0)};
-                }
-                if (sslerr == SSL_ERROR_WANT_READ) {
-                    sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
-                    co_await awaiter;
-                    continue;
-                }
-                if (sslerr == SSL_ERROR_WANT_WRITE) {
-                    sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, tok);
-                    co_await awaiter;
-                    continue;
-                }
-                co_return stl::make_error<size_t>("SSL_read: {}", drain_ssl_errors());
+            int sslerr = ::SSL_get_error(m_ssl, n);
+            if (sslerr == SSL_ERROR_ZERO_RETURN)
+                co_return stl::result<size_t>{stl::success, static_cast<size_t>(0)};
+            if (sslerr == SSL_ERROR_SYSCALL && n == 0) {
+                ::ERR_clear_error();
+                co_return stl::result<size_t>{stl::success, static_cast<size_t>(0)};
             }
-        } catch (const sap::async::CancelledError&) {
-            co_return stl::make_error<size_t>("read cancelled");
-        } catch (const sap::async::ReactorError& e) {
-            co_return stl::make_error<size_t>("read: reactor: {}", e.what());
+            if (sslerr == SSL_ERROR_WANT_READ || sslerr == SSL_ERROR_WANT_WRITE) {
+                auto interest = (sslerr == SSL_ERROR_WANT_READ) ? sap::io::Event::Readable : sap::io::Event::Writable;
+                sap::async::IoAwaiter awaiter(*m_ex, m_handle, interest, tok);
+                if (auto r = co_await awaiter; !r)
+                    co_return stl::make_error<size_t>("read: {}", r.error());
+                continue;
+            }
+            co_return stl::make_error<size_t>("SSL_read: {}", drain_ssl_errors());
         }
     }
 
@@ -325,29 +295,20 @@ namespace sap::network {
             co_return stl::make_error<size_t>("operation already in flight");
         op_lock_releaser releaser{&m_op_in_flight};
 
-        try {
-            for (;;) {
-                int n = ::SSL_write(m_ssl, buf.data(), static_cast<int>(buf.size()));
-                if (n > 0)
-                    co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
+        for (;;) {
+            int n = ::SSL_write(m_ssl, buf.data(), static_cast<int>(buf.size()));
+            if (n > 0)
+                co_return stl::result<size_t>{stl::success, static_cast<size_t>(n)};
 
-                int sslerr = ::SSL_get_error(m_ssl, n);
-                if (sslerr == SSL_ERROR_WANT_READ) {
-                    sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
-                    co_await awaiter;
-                    continue;
-                }
-                if (sslerr == SSL_ERROR_WANT_WRITE) {
-                    sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, tok);
-                    co_await awaiter;
-                    continue;
-                }
-                co_return stl::make_error<size_t>("SSL_write: {}", drain_ssl_errors());
+            int sslerr = ::SSL_get_error(m_ssl, n);
+            if (sslerr == SSL_ERROR_WANT_READ || sslerr == SSL_ERROR_WANT_WRITE) {
+                auto interest = (sslerr == SSL_ERROR_WANT_READ) ? sap::io::Event::Readable : sap::io::Event::Writable;
+                sap::async::IoAwaiter awaiter(*m_ex, m_handle, interest, tok);
+                if (auto r = co_await awaiter; !r)
+                    co_return stl::make_error<size_t>("write: {}", r.error());
+                continue;
             }
-        } catch (const sap::async::CancelledError&) {
-            co_return stl::make_error<size_t>("write cancelled");
-        } catch (const sap::async::ReactorError& e) {
-            co_return stl::make_error<size_t>("write: reactor: {}", e.what());
+            co_return stl::make_error<size_t>("SSL_write: {}", drain_ssl_errors());
         }
     }
 
@@ -358,33 +319,25 @@ namespace sap::network {
             co_return stl::make_error<>("operation already in flight");
         op_lock_releaser releaser{&m_op_in_flight};
 
-        try {
-            for (;;) {
-                int rc = ::SSL_shutdown(m_ssl);
-                if (rc == 1)
-                    co_return stl::result<>{};
-                if (rc == 0) {
-                    sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
-                    co_await awaiter;
-                    continue;
-                }
-                int sslerr = ::SSL_get_error(m_ssl, rc);
-                if (sslerr == SSL_ERROR_WANT_READ) {
-                    sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
-                    co_await awaiter;
-                    continue;
-                }
-                if (sslerr == SSL_ERROR_WANT_WRITE) {
-                    sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Writable, tok);
-                    co_await awaiter;
-                    continue;
-                }
-                co_return stl::make_error<>("SSL_shutdown: {}", drain_ssl_errors());
+        for (;;) {
+            int rc = ::SSL_shutdown(m_ssl);
+            if (rc == 1)
+                co_return stl::result<>{};
+            if (rc == 0) {
+                sap::async::IoAwaiter awaiter(*m_ex, m_handle, sap::io::Event::Readable, tok);
+                if (auto r = co_await awaiter; !r)
+                    co_return stl::make_error<>("shutdown: {}", r.error());
+                continue;
             }
-        } catch (const sap::async::CancelledError&) {
-            co_return stl::make_error<>("shutdown cancelled");
-        } catch (const sap::async::ReactorError& e) {
-            co_return stl::make_error<>("shutdown: reactor: {}", e.what());
+            int sslerr = ::SSL_get_error(m_ssl, rc);
+            if (sslerr == SSL_ERROR_WANT_READ || sslerr == SSL_ERROR_WANT_WRITE) {
+                auto interest = (sslerr == SSL_ERROR_WANT_READ) ? sap::io::Event::Readable : sap::io::Event::Writable;
+                sap::async::IoAwaiter awaiter(*m_ex, m_handle, interest, tok);
+                if (auto r = co_await awaiter; !r)
+                    co_return stl::make_error<>("shutdown: {}", r.error());
+                continue;
+            }
+            co_return stl::make_error<>("SSL_shutdown: {}", drain_ssl_errors());
         }
     }
 

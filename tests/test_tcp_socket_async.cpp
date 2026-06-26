@@ -21,7 +21,6 @@
 
 using namespace sap::network;
 using namespace std::chrono_literals;
-using sap::async::CancelledError;
 using sap::async::Executor;
 using sap::async::sleep_for;
 using sap::async::spawn;
@@ -84,16 +83,16 @@ namespace {
         co_return stl::move(child);
     }
 
-    Task<void> fire_stop_after(Executor& ex, std::chrono::milliseconds dt, StopSource& src) {
-        co_await sleep_for(ex, dt);
+    Task<stl::result<>> fire_stop_after(Executor& ex, std::chrono::milliseconds dt, StopSource& src) {
+        if (auto r = co_await sleep_for(ex, dt); !r)
+            co_return r;
         src.request_stop();
+        co_return stl::success;
     }
 
     Task<stl::result<>> hold_until_stopped(Executor& ex, TCPSocketAsync /*sock*/, StopToken tok) {
-        try {
-            co_await sleep_for(ex, 1h, tok);
-        } catch (const CancelledError&) {
-        }
+        if (auto r = co_await sleep_for(ex, 1h, tok); !r && !tok.stop_requested())
+            co_return r;
         co_return stl::result<>{};
     }
 
@@ -327,7 +326,8 @@ TEST_F(TCPSocketAsyncTest, SecondConcurrentOp_ReturnsError) {
 
         std::byte buf1[32];
         auto      first = spawn(e, client.read(stl::span<stl::byte>(buf1, sizeof(buf1)), cancel_first.token()));
-        co_await sleep_for(e, 10ms);
+        if (auto r = co_await sleep_for(e, 10ms); !r)
+            co_return stl::make_error<>("sleep_for: {}", r.error());
 
         std::byte buf2[32];
         auto      r = co_await client.read(stl::span<stl::byte>(buf2, sizeof(buf2)));
@@ -355,7 +355,8 @@ TEST_F(TCPSocketAsyncTest, WriteParksWhenSendBufferFull) {
             auto child = co_await accept_one(stl::move(l));
             if (!child)
                 co_return stl::make_error<size_t>("accept: {}", child.error());
-            co_await sleep_for(ex_in, 30ms);
+            if (auto r = co_await sleep_for(ex_in, 30ms); !r)
+                co_return stl::make_error<size_t>("sleep_for: {}", r.error());
             co_return co_await drain_all(stl::move(child.value()), expected);
         }(e, stl::move(listener), total));
 
