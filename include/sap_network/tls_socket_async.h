@@ -43,6 +43,10 @@ namespace sap::network {
 
         sap::async::Task<stl::result<>> shutdown(sap::async::StopToken tok = {});
         void                            close();
+        // Thread-safe socket shutdown; wakes any in-flight async read/write
+        // by triggering POLLHUP on the fd. Caller still owns the socket; the
+        // fd is not closed until close() or destruction.
+        void                            interrupt() noexcept;
 
         bool                valid() const noexcept { return m_handle != INVALID_SOCKET_HANDLE; }
         SocketHandle        native_handle() const noexcept { return m_handle; }

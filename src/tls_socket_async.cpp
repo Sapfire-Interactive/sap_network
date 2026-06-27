@@ -353,6 +353,12 @@ namespace sap::network {
         }
     }
 
+    void TLSSocketAsync::interrupt() noexcept {
+        SocketHandle h = m_handle;
+        if (h != INVALID_SOCKET_HANDLE)
+            internal::shutdown(h);
+    }
+
     stl::string TLSSocketAsync::negotiated_protocol() const {
         if (m_ssl == nullptr)
             return {};
