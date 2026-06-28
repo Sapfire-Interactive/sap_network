@@ -11,7 +11,11 @@
 #include <sap_core/async/sync_wait.h>
 #include <sap_core/async/task.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <sys/socket.h>
+#endif
 
 #include <chrono>
 #include <cstddef>
@@ -361,8 +365,8 @@ TEST_F(TCPSocketAsyncTest, WriteParksWhenSendBufferFull) {
         }(e, stl::move(listener), total));
 
         auto client = make_client(e, PORT_WRITE_PARKS);
-        int  small  = 8 * 1024;
-        ::setsockopt(client.native_handle(), SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+        int  snd_buf = 8 * 1024;
+        ::setsockopt(client.native_handle(), SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&snd_buf), sizeof(snd_buf));
         auto cr = co_await client.connect();
         if (!cr)
             co_return stl::make_error<>("connect: {}", cr.error());

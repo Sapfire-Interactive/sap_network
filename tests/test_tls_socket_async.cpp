@@ -73,9 +73,11 @@ namespace {
             ::X509_gmtime_adj(::X509_getm_notBefore(x509), 0);
             ::X509_gmtime_adj(::X509_getm_notAfter(x509), 31536000L);
             ::X509_set_pubkey(x509, pkey);
-            X509_NAME* name = ::X509_get_subject_name(x509);
+            X509_NAME* name = ::X509_NAME_new();
             ::X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
+            ::X509_set_subject_name(x509, name);
             ::X509_set_issuer_name(x509, name);
+            ::X509_NAME_free(name);
             X509V3_CTX v3ctx;
             X509V3_set_ctx_nodb(&v3ctx);
             ::X509V3_set_ctx(&v3ctx, x509, x509, nullptr, nullptr, 0);

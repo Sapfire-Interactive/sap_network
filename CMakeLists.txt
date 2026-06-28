@@ -53,7 +53,7 @@ target_link_libraries(sap_network_lib
 )
 
 if(WIN32)
-    target_link_libraries(sap_network_lib PRIVATE Crypt32)
+    target_link_libraries(sap_network_lib PRIVATE ws2_32 Crypt32)
 endif()
 
 if(SAP_NETWORK_BUILD_TESTS)
