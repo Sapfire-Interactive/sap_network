@@ -1,5 +1,6 @@
 #pragma once
 #include "sap_network/platform.h"
+#include "sap_network/deadline.h"
 #include "sap_network/socket_concept.h"
 #include "sap_network/socket_config.h"
 
@@ -19,7 +20,10 @@ namespace sap::network {
         bool bind();
         bool listen();
         bool connect();
+        // Finite deadlines require a numeric IPv4 host (no blocking resolver).
+        bool connect_until(Deadline deadline);
         stl::result<TCPSocket> accept();
+        stl::result<TCPSocket> accept_until(Deadline deadline);
         stl::result<size_t> send(stl::span<const stl::byte> data);
         stl::result<size_t> recv(stl::span<stl::byte> data);
         void close();

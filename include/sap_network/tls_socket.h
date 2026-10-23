@@ -40,8 +40,11 @@ namespace sap::network {
 
         // Socket concept surface (mirrors TCPSocket's common methods).
         bool connect(); // Client-only: TCP connect + SSL_connect + verify.
+        bool connect_until(Deadline deadline);
         stl::result<size_t> send(stl::span<const stl::byte> data); // SSL_write.
         stl::result<size_t> recv(stl::span<stl::byte> data); // SSL_read; 0 = peer-closed.
+        stl::result<size_t> send_until(stl::span<const stl::byte> data, Deadline deadline);
+        stl::result<size_t> recv_until(stl::span<stl::byte> data, Deadline deadline);
         void interrupt_blocking_io();
         void close(); // SSL_shutdown → TCP close.
         bool valid() const;
@@ -51,8 +54,9 @@ namespace sap::network {
         bool bind();
         bool listen();
         stl::result<TLSSocket> accept(); // Server-only: TCP accept + SSL_accept.
+        stl::result<TLSSocket> accept_until(Deadline deadline);
 
-        // Timeouts apply to the underlying TCP layer; TLS inherits them.
+        // Fixed per-operation budgets, including all WANT_READ/WANT_WRITE retries.
         void set_recv_timeout(std::chrono::milliseconds ms);
         void set_send_timeout(std::chrono::milliseconds ms);
 
@@ -71,6 +75,7 @@ namespace sap::network {
         // Used by accept() to wrap a freshly-accepted server-side TCP
         // connection + its SSL*.
         TLSSocket(TCPSocket tcp, ssl_st* ssl, TlsAcceptedConfig config);
+        stl::result<TLSSocket> accept_impl(Deadline deadline, bool include_wait);
 
     public:
         // Public so free helpers in the .cpp can std::visit it without needing

@@ -1,5 +1,11 @@
 # `TLSSocket` — A Walkthrough
 
+> Historical implementation walkthrough: the examples below predate the split
+> client/server configuration and bounded nonblocking implementation. Use the
+> [current bounded TLS contract](bounded_tls.md) and public headers for new code.
+> In particular, plaintext logging is now opt-in in every build, TLS operations
+> retry under one deadline, and socket/identity setup failures are checked.
+
 This guide walks through `sap::network::TLSSocket` end to end, in the same
 spirit as the [OpenSSL TLS client tutorial][openssl-guide]. The goal is for
 a reader new to either the codebase or to OpenSSL to be able to follow what

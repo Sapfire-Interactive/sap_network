@@ -1,4 +1,5 @@
 #include "tls_internal.h"
+#include "socket_internal.h"
 
 #include <cstring>
 #include <format>
@@ -32,6 +33,18 @@ namespace sap::network::internal {
         void mix_hash(size_t& h, size_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); }
 
         int min_proto_version_int(ETlsMinVersion v) { return v == ETlsMinVersion::TLS_1_3 ? TLS1_3_VERSION : TLS1_2_VERSION; }
+
+        bool valid_alpn(const stl::vector<stl::string>& protocols) {
+            size_t total = 0;
+            for (const auto& protocol : protocols) {
+                if (protocol.empty() || protocol.size() > 255)
+                    return false;
+                total += protocol.size() + 1;
+                if (total > 65535)
+                    return false;
+            }
+            return true;
+        }
 
         // ---- client cache --------------------------------------------------
 
@@ -77,30 +90,44 @@ namespace sap::network::internal {
         }
 
         SSL_CTX* build_client_ctx(const TlsClientConfig& cfg) {
+            if (!valid_alpn(cfg.alpn_protocols) || (cfg.verify_hostname && !cfg.verify_peer) ||
+                cfg.client_cert_file.empty() != cfg.client_key_file.empty())
+                return nullptr;
             SSL_CTX* ctx = ::SSL_CTX_new(::TLS_client_method());
             if (ctx == nullptr)
                 return nullptr;
 
-            ::SSL_CTX_set_min_proto_version(ctx, min_proto_version_int(cfg.min_version));
-            ::SSL_CTX_set_max_early_data(ctx, 0); // disable 0-RTT replay surface
+            if (::SSL_CTX_set_min_proto_version(ctx, min_proto_version_int(cfg.min_version)) != 1 ||
+                ::SSL_CTX_set_max_early_data(ctx, 0) != 1) {
+                ::SSL_CTX_free(ctx);
+                return nullptr;
+            }
 
             ::SSL_CTX_set_verify(ctx, cfg.verify_peer ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, nullptr);
 
-            if (!cfg.ca_file.empty()) {
-                ::SSL_CTX_load_verify_locations(ctx, cfg.ca_file.c_str(), nullptr);
-            } else if (!cfg.ca_dir.empty()) {
-                ::SSL_CTX_load_verify_locations(ctx, nullptr, cfg.ca_dir.c_str());
-            } else {
+            bool trust_ok = true;
+            if (!cfg.ca_file.empty() || !cfg.ca_dir.empty()) {
+                trust_ok = ::SSL_CTX_load_verify_locations(ctx, cfg.ca_file.empty() ? nullptr : cfg.ca_file.c_str(),
+                                                           cfg.ca_dir.empty() ? nullptr : cfg.ca_dir.c_str()) == 1;
+            } else if (cfg.verify_peer) {
 #ifdef _WIN32
-                load_system_trust_store(ctx);
+                trust_ok = load_system_trust_store(ctx) > 0;
 #else
-                ::SSL_CTX_set_default_verify_paths(ctx);
+                trust_ok = ::SSL_CTX_set_default_verify_paths(ctx) == 1;
 #endif
+            }
+            if (!trust_ok) {
+                ::SSL_CTX_free(ctx);
+                return nullptr;
             }
 
             if (!cfg.client_cert_file.empty() && !cfg.client_key_file.empty()) {
-                ::SSL_CTX_use_certificate_chain_file(ctx, cfg.client_cert_file.c_str());
-                ::SSL_CTX_use_PrivateKey_file(ctx, cfg.client_key_file.c_str(), SSL_FILETYPE_PEM);
+                if (::SSL_CTX_use_certificate_chain_file(ctx, cfg.client_cert_file.c_str()) != 1 ||
+                    ::SSL_CTX_use_PrivateKey_file(ctx, cfg.client_key_file.c_str(), SSL_FILETYPE_PEM) != 1 ||
+                    ::SSL_CTX_check_private_key(ctx) != 1) {
+                    ::SSL_CTX_free(ctx);
+                    return nullptr;
+                }
             }
 
             return ctx;
@@ -170,12 +197,17 @@ namespace sap::network::internal {
         }
 
         SSL_CTX* build_server_ctx(const TlsServerConfig& cfg, ServerCtxEntry& entry) {
+            if (!valid_alpn(cfg.alpn_protocols))
+                return nullptr;
             SSL_CTX* ctx = ::SSL_CTX_new(::TLS_server_method());
             if (ctx == nullptr)
                 return nullptr;
 
-            ::SSL_CTX_set_min_proto_version(ctx, min_proto_version_int(cfg.min_version));
-            ::SSL_CTX_set_max_early_data(ctx, 0); // disable 0-RTT replay surface
+            if (::SSL_CTX_set_min_proto_version(ctx, min_proto_version_int(cfg.min_version)) != 1 ||
+                ::SSL_CTX_set_max_early_data(ctx, 0) != 1) {
+                ::SSL_CTX_free(ctx);
+                return nullptr;
+            }
 
             if (cfg.cert_file.empty() || cfg.key_file.empty()) {
                 ::SSL_CTX_free(ctx);
@@ -190,11 +222,8 @@ namespace sap::network::internal {
                 ::SSL_CTX_set_alpn_select_cb(ctx, server_alpn_select_cb, &entry.alpn);
 
             if (cfg.require_client_cert) {
-                // TLS 1.3 delivers the rejection alert after SSL_connect returns on the
-                // client side. Cap at TLS 1.2 so rejection is synchronous.
-                // TODO: OpenSSL supports SSL_verify_client_post_handshake() / SSL_CTX_set_post_handshake_auth() for proper TLS 1.3 client authentication
-                // Implement this when TLS 1.3 becomes a requirement.
-                ::SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+                // TLS 1.3 verifies the client during the handshake too. Rejection
+                // is authoritative at accept(); the client may see it on its next I/O.
                 // require_client_cert without trust roots is a misconfiguration
                 // — no client cert can ever verify. Fail fast at ctx-build time.
                 if (cfg.ca_file.empty() && cfg.ca_dir.empty()) {
@@ -266,14 +295,27 @@ namespace sap::network::internal {
         return result;
     }
 
-    void setup_client_ssl(SSL* ssl, const TlsClientConfig& cfg, SocketHandle fd) {
-        ::SSL_set_fd(ssl, static_cast<int>(fd));
+    bool attach_socket(SSL* ssl, SocketHandle fd) {
+        if (fd == INVALID_SOCKET_HANDLE || fd > static_cast<SocketHandle>((std::numeric_limits<int>::max)()))
+            return false;
+        return ::SSL_set_fd(ssl, static_cast<int>(fd)) == 1;
+    }
+
+    bool setup_client_ssl(SSL* ssl, const TlsClientConfig& cfg, SocketHandle fd) {
+        if (!attach_socket(ssl, fd) || !valid_alpn(cfg.alpn_protocols))
+            return false;
 
         const stl::string& host = cfg.sni_hostname.empty() ? cfg.tcp.host : cfg.sni_hostname;
+        if (host.find('\0') != stl::string::npos || (host.empty() && cfg.verify_hostname))
+            return false;
         if (!host.empty()) {
-            ::SSL_set_tlsext_host_name(ssl, host.c_str());
-            if (cfg.verify_hostname)
-                ::SSL_set1_host(ssl, host.c_str());
+            unsigned char address[16];
+            bool ip = ::inet_pton(AF_INET, host.c_str(), address) == 1 || ::inet_pton(AF_INET6, host.c_str(), address) == 1;
+            if (!ip && ::SSL_set_tlsext_host_name(ssl, host.c_str()) != 1)
+                return false;
+            if (cfg.verify_hostname && (ip ? ::X509_VERIFY_PARAM_set1_ip_asc(::SSL_get0_param(ssl), host.c_str())
+                                           : ::X509_VERIFY_PARAM_set1_host(::SSL_get0_param(ssl), host.c_str(), host.size())) != 1)
+                return false;
         }
 
         if (!cfg.alpn_protocols.empty()) {
@@ -282,13 +324,15 @@ namespace sap::network::internal {
                 wire.push_back(static_cast<unsigned char>(p.size()));
                 wire.insert(wire.end(), p.begin(), p.end());
             }
-            ::SSL_set_alpn_protos(ssl, wire.data(), static_cast<unsigned int>(wire.size()));
+            if (::SSL_set_alpn_protos(ssl, wire.data(), static_cast<unsigned int>(wire.size())) != 0)
+                return false;
         }
+        return true;
     }
 
     stl::string format_handshake_error(const char* stage, SSL* ssl) {
-        long        verify = ::SSL_get_verify_result(ssl);
-        stl::string err    = drain_ssl_errors();
+        long verify = ::SSL_get_verify_result(ssl);
+        stl::string err = drain_ssl_errors();
         if (verify != X509_V_OK) {
             const char* reason = ::X509_verify_cert_error_string(verify);
             return std::format("{} failed (verify {}: {}): {}", stage, verify, reason, err);

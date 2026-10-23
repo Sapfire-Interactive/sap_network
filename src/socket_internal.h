@@ -1,12 +1,15 @@
 #pragma once
 
 #include "sap_network/platform.h"
+#include "sap_network/deadline.h"
 
 #include <sap_core/stl/string.h>
 
 #include <cerrno>
 #include <cstring>
 #include <string>
+#include <algorithm>
+#include <limits>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -18,6 +21,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <poll.h>
 #endif
 
 namespace sap::network::internal {
@@ -38,15 +42,15 @@ namespace sap::network::internal {
 #endif
     }
 
-    inline void set_nonblocking(SocketHandle h, bool enable) {
+    inline bool set_nonblocking(SocketHandle h, bool enable) {
 #ifdef _WIN32
         u_long mode = enable ? 1u : 0u;
-        ::ioctlsocket(h, FIONBIO, &mode);
+        return ::ioctlsocket(h, FIONBIO, &mode) == 0;
 #else
         int flags = ::fcntl(h, F_GETFL, 0);
         if (flags < 0)
-            return;
-        ::fcntl(h, F_SETFL, enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
+            return false;
+        return ::fcntl(h, F_SETFL, enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) == 0;
 #endif
     }
 
@@ -94,43 +98,67 @@ namespace sap::network::internal {
 #endif
     }
 
-    // Wait up to `timeout_ms` for fd to become writable. Returns true if the
-    // socket is writable and has no pending SO_ERROR. Used for non-blocking
-    // connect() to implement a connect timeout.
-    inline bool wait_writable(SocketHandle h, long timeout_ms) {
-        timeval tv{};
-        tv.tv_sec = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        fd_set write_fds;
-        FD_ZERO(&write_fds);
-        FD_SET(h, &write_fds);
+    inline bool expired(Deadline deadline) { return std::chrono::steady_clock::now() >= deadline; }
+
+    // EINTR and TLS retries retain the original deadline. poll avoids FD_SETSIZE
+    // limitations on POSIX; Windows select stores SOCKETs without narrowing.
+    inline bool wait_ready(SocketHandle h, bool write, Deadline deadline) {
+        for (;;) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+                return false;
+            auto ms =
+                deadline == (Deadline::max)()
+                    ? 60000LL
+                    : (std::min)(60000LL, static_cast<long long>(std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count()));
 #ifdef _WIN32
-        int nfds = 0; // ignored on Windows
+            timeval tv{static_cast<long>(ms / 1000), static_cast<long>((ms % 1000) * 1000)};
+            fd_set fds, errors;
+            FD_ZERO(&fds);
+            FD_ZERO(&errors);
+            FD_SET(h, &fds);
+            FD_SET(h, &errors);
+            int rc = ::select(0, write ? nullptr : &fds, write ? &fds : nullptr, &errors, &tv);
+            if (rc < 0 && last_error() == WSAEINTR)
+                continue;
 #else
-        int nfds = static_cast<int>(h) + 1;
+            pollfd fd{h, static_cast<short>(write ? POLLOUT : POLLIN), 0};
+            int rc = ::poll(&fd, 1, static_cast<int>(ms));
+            if (rc < 0 && errno == EINTR)
+                continue;
 #endif
-        if (::select(nfds, nullptr, &write_fds, nullptr, &tv) != 1)
+            if (rc > 0)
+                return !expired(deadline);
+            if (rc < 0)
+                return false;
+        }
+    }
+
+    inline bool connect_ready(SocketHandle h, Deadline deadline) {
+        if (!wait_ready(h, true, deadline))
             return false;
         int err = 0;
         socklen_t err_len = sizeof(err);
-        ::getsockopt(h, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &err_len);
-        return err == 0;
+        return ::getsockopt(h, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &err_len) == 0 && err == 0;
     }
 
-    inline void apply_recv_timeout(SocketHandle h, std::chrono::milliseconds ms) {
+    inline bool apply_timeout(SocketHandle h, int option, std::chrono::milliseconds ms) {
+        if (ms.count() < 0)
+            return false;
+#ifdef _WIN32
+        DWORD value = static_cast<DWORD>((std::min)(ms.count(), static_cast<decltype(ms.count())>((std::numeric_limits<DWORD>::max)())));
+        return ::setsockopt(h, SOL_SOCKET, option, reinterpret_cast<const char*>(&value), sizeof(value)) == 0;
+#else
         auto count = ms.count();
         timeval tv{};
         tv.tv_sec = static_cast<long>(count / 1000);
         tv.tv_usec = static_cast<long>((count % 1000) * 1000);
-        ::setsockopt(h, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+        return ::setsockopt(h, SOL_SOCKET, option, reinterpret_cast<const char*>(&tv), sizeof(tv)) == 0;
+#endif
     }
 
-    inline void apply_send_timeout(SocketHandle h, std::chrono::milliseconds ms) {
-        auto count = ms.count();
-        timeval tv{};
-        tv.tv_sec = static_cast<long>(count / 1000);
-        tv.tv_usec = static_cast<long>((count % 1000) * 1000);
-        ::setsockopt(h, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
-    }
+    inline bool apply_recv_timeout(SocketHandle h, std::chrono::milliseconds ms) { return apply_timeout(h, SO_RCVTIMEO, ms); }
+
+    inline bool apply_send_timeout(SocketHandle h, std::chrono::milliseconds ms) { return apply_timeout(h, SO_SNDTIMEO, ms); }
 
 } // namespace sap::network::internal

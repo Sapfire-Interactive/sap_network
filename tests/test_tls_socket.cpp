@@ -3,6 +3,8 @@
 #include "sap_network/platform.h"
 #include "sap_network/socket_concept.h"
 #include "sap_network/tls_socket.h"
+#include "../src/socket_internal.h"
+#include "../src/tls_internal.h"
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -14,6 +16,8 @@
 #endif
 
 #include <atomic>
+#include <array>
+#include <memory>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -66,14 +70,14 @@ static_assert(Socket<TLSSocket>);
 
 class SelfSignedCert {
 public:
-    SelfSignedCert() {
+    SelfSignedCert(bool expired = false, const char* san = "DNS:localhost,IP:127.0.0.1") {
         // Per-instance temp dir to keep parallel runs isolated.
         std::random_device rd;
         m_dir = fs::temp_directory_path() / fs::path{"sap_tls_test_" + std::to_string(rd())};
         fs::create_directories(m_dir);
         cert_file = (m_dir / "cert.pem").string();
         key_file  = (m_dir / "key.pem").string();
-        generate();
+        generate(expired, san);
     }
 
     ~SelfSignedCert() {
@@ -88,7 +92,7 @@ public:
     std::string key_file;
 
 private:
-    void generate() {
+    void generate(bool expired, const char* san) {
         EVP_PKEY* pkey = ::EVP_RSA_gen(2048);
         ASSERT_NE(pkey, nullptr);
 
@@ -96,8 +100,9 @@ private:
         ASSERT_NE(x509, nullptr);
 
         ::ASN1_INTEGER_set(::X509_get_serialNumber(x509), 1);
-        ::X509_gmtime_adj(::X509_getm_notBefore(x509), 0);
-        ::X509_gmtime_adj(::X509_getm_notAfter(x509), 31536000L); // 1 year
+        ::X509_set_version(x509, 2);
+        ::X509_gmtime_adj(::X509_getm_notBefore(x509), -3600);
+        ::X509_gmtime_adj(::X509_getm_notAfter(x509), expired ? -60 : 31536000L);
         ::X509_set_pubkey(x509, pkey);
 
         X509_NAME* name = ::X509_NAME_new();
@@ -109,7 +114,7 @@ private:
         X509V3_CTX v3ctx;
         X509V3_set_ctx_nodb(&v3ctx); // macro — must not be qualified with ::
         ::X509V3_set_ctx(&v3ctx, x509, x509, nullptr, nullptr, 0);
-        if (X509_EXTENSION* ext = ::X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_subject_alt_name, "DNS:localhost,IP:127.0.0.1")) {
+        if (X509_EXTENSION* ext = ::X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_subject_alt_name, san)) {
             ::X509_add_ext(x509, ext, -1);
             ::X509_EXTENSION_free(ext);
         }
@@ -294,6 +299,319 @@ static std::thread spawn_loopback_server(TLSSocket& server, Body body) {
 // ---------------------------------------------------------------------------
 // Construction / lifecycle
 // ---------------------------------------------------------------------------
+
+TEST_F(TLSSocketTest, ConfiguredTcpTimeoutsUseNativeUnits) {
+    TCPSocket tcp({.host = "127.0.0.1", .recv_timeout = 123ms, .send_timeout = 456ms});
+    ASSERT_TRUE(tcp.valid());
+#ifdef _WIN32
+    DWORD receive = 0, send = 0;
+    socklen_t size = sizeof(receive);
+    ASSERT_EQ(::getsockopt(tcp.native_handle(), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&receive), &size), 0);
+    size = sizeof(send);
+    ASSERT_EQ(::getsockopt(tcp.native_handle(), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&send), &size), 0);
+    EXPECT_EQ(receive, 123u);
+    EXPECT_EQ(send, 456u);
+#endif
+    tcp.set_recv_timeout(200ms);
+    EXPECT_EQ(tcp.config().recv_timeout, 200ms);
+}
+
+TEST_F(TLSSocketTest, FiniteConnectRejectsDnsBeforeResolution) {
+    TLSSocket client(TlsClientConfig{.tcp = {.host = "unresolvable.invalid", .port = 443, .connect_timeout = 100ms},
+        .verify_peer = false, .verify_hostname = false});
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.connect());
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 500ms);
+    EXPECT_NE(client.handshake_error().find("numeric"), std::string::npos);
+}
+
+TEST_F(TLSSocketTest, ExpiredAcceptDeadlineDoesNotWaitForConnection) {
+    SelfSignedCert cert;
+    TLSSocket server(TlsServerConfig{.tcp = {.host = "127.0.0.1", .port = 0}, .cert_file = cert.cert_file, .key_file = cert.key_file});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(server.accept_until(start + 100ms));
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
+    EXPECT_TRUE(server.valid());
+}
+
+TEST_F(TLSSocketTest, SlowPartialHandshakeRetainsOriginalDeadline) {
+    TCPSocket server({.host = "127.0.0.1", .port = 19400, .reuse_addr = true});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+    std::jthread worker([&] {
+        auto peer = server.accept_until(deadline_after(2s));
+        if (!peer) return;
+        peer.value().set_send_timeout(200ms);
+        // Incomplete TLS record: progress every 30 ms must not reset the budget.
+        std::byte header[]{std::byte{22}, std::byte{3}, std::byte{3}, std::byte{0}, std::byte{100}};
+        if (!peer.value().send(header)) return;
+        for (int i = 0; i < 25; ++i) {
+            std::this_thread::sleep_for(30ms);
+            std::byte byte{};
+            if (!peer.value().send({&byte, 1})) break;
+        }
+    });
+    TLSSocket client(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = 19400, .connect_timeout = 180ms},
+        .verify_peer = false, .verify_hostname = false});
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.connect());
+    EXPECT_GE(std::chrono::steady_clock::now() - start, 120ms);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 600ms);
+    EXPECT_FALSE(client.valid());
+    std::byte byte{};
+    EXPECT_FALSE(client.send({&byte, 1}));
+}
+
+TEST_F(TLSSocketTest, AcceptedHandshakeIsBounded) {
+    SelfSignedCert cert;
+    TLSSocket server(TlsServerConfig{.tcp = {.host = "127.0.0.1", .port = 19401, .connect_timeout = 120ms, .reuse_addr = true},
+        .cert_file = cert.cert_file, .key_file = cert.key_file});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+    TCPSocket silent({.host = "127.0.0.1", .port = 19401, .connect_timeout = 500ms});
+    ASSERT_TRUE(silent.connect());
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(server.accept());
+    EXPECT_GE(std::chrono::steady_clock::now() - start, 80ms);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 600ms);
+}
+
+TEST_F(TLSSocketTest, RepeatedReadsShareDeadlineAndCapTransfers) {
+    SelfSignedCert cert;
+    TLSSocket server(TlsServerConfig{.tcp = {.host = "127.0.0.1", .port = 19402, .send_timeout = 200ms, .reuse_addr = true},
+        .cert_file = cert.cert_file, .key_file = cert.key_file});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+    std::jthread worker([&] {
+        auto peer = server.accept_until(deadline_after(2s));
+        if (!peer) return;
+        std::byte byte{42};
+        for (int i = 0; i < 30; ++i) {
+            if (!peer.value().send({&byte, 1})) break;
+            std::this_thread::sleep_for(25ms);
+        }
+    });
+    TLSSocket client(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = 19402, .connect_timeout = 1s}, .ca_file = cert.cert_file,
+        .min_version = ETlsMinVersion::TLS_1_3});
+    ASSERT_TRUE(client.connect()) << client.handshake_error();
+    auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + 160ms;
+    size_t total = 0;
+    std::vector<std::byte> bytes(100000);
+    for (;;) {
+        auto result = client.recv_until(bytes, deadline);
+        if (!result) break;
+        ASSERT_GT(result.value(), 0u);
+        EXPECT_LE(result.value(), 65536u);
+        total += result.value();
+    }
+    EXPECT_GT(total, 0u);
+    EXPECT_LT(total, 30u);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 600ms);
+    EXPECT_FALSE(client.valid());
+}
+
+TEST_F(TLSSocketTest, SlowEncryptedRecordCannotRenewReadTimeout) {
+    SelfSignedCert cert;
+    TlsServerConfig cfg{.cert_file = cert.cert_file, .key_file = cert.key_file, .min_version = ETlsMinVersion::TLS_1_3};
+    SSL_CTX* ctx = internal::acquire_ctx(cfg);
+    ASSERT_NE(ctx, nullptr);
+    TCPSocket server({.host = "127.0.0.1", .port = 19406, .recv_timeout = 1s, .send_timeout = 1s, .reuse_addr = true});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+    std::jthread worker([&] {
+        auto peer = server.accept_until(deadline_after(2s));
+        if (!peer) return;
+        std::unique_ptr<SSL, decltype(&SSL_free)> ssl(SSL_new(ctx), SSL_free);
+        ASSERT_NE(ssl, nullptr);
+        ASSERT_TRUE(internal::attach_socket(ssl.get(), peer.value().native_handle()));
+        ASSERT_EQ(SSL_accept(ssl.get()), 1);
+        // Capture a genuine encrypted application record, then trickle its
+        // ciphertext. No complete application byte reaches SSL_read in time.
+        BIO* encrypted = BIO_new(BIO_s_mem());
+        ASSERT_NE(encrypted, nullptr);
+        SSL_set0_wbio(ssl.get(), encrypted);
+        std::array<char, 128> plaintext{};
+        ASSERT_EQ(SSL_write(ssl.get(), plaintext.data(), static_cast<int>(plaintext.size())), plaintext.size());
+        char* record = nullptr;
+        long size = BIO_get_mem_data(encrypted, &record);
+        ASSERT_GT(size, 25);
+        ASSERT_TRUE(peer.value().send({reinterpret_cast<const std::byte*>(record), 5}));
+        for (int i = 5; i < 25; ++i) {
+            std::this_thread::sleep_for(30ms);
+            if (!peer.value().send({reinterpret_cast<const std::byte*>(record + i), 1})) break;
+        }
+    });
+    TLSSocket client(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = 19406, .connect_timeout = 1s, .recv_timeout = 150ms},
+        .ca_file = cert.cert_file, .min_version = ETlsMinVersion::TLS_1_3});
+    ASSERT_TRUE(client.connect()) << client.handshake_error();
+    std::byte byte{};
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(client.recv({&byte, 1}));
+    EXPECT_GE(std::chrono::steady_clock::now() - start, 100ms);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 550ms);
+    EXPECT_FALSE(client.valid());
+}
+
+TEST_F(TLSSocketTest, ShutdownDoesNotWaitIndefinitelyForPeer) {
+    SelfSignedCert cert;
+    TLSSocket server(TlsServerConfig{.tcp = {.host = "127.0.0.1", .port = 19407, .reuse_addr = true},
+        .cert_file = cert.cert_file, .key_file = cert.key_file});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::jthread worker([&] {
+        auto peer = server.accept_until(deadline_after(2s));
+        if (peer) released.wait_for(2s);
+    });
+    TLSSocket client(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = 19407, .connect_timeout = 1s}, .ca_file = cert.cert_file});
+    ASSERT_TRUE(client.connect()) << client.handshake_error();
+    auto start = std::chrono::steady_clock::now();
+    client.close();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    release.set_value();
+    EXPECT_LT(elapsed, 1s);
+    EXPECT_FALSE(client.valid());
+}
+
+TEST_F(TLSSocketTest, Tls13MinimumRejectsTls12Peer) {
+    SelfSignedCert cert;
+    TlsServerConfig cfg{.tcp = {.host = "127.0.0.1", .port = 19408, .reuse_addr = true},
+        .cert_file = cert.cert_file, .key_file = cert.key_file};
+    SSL_CTX* ctx = internal::acquire_ctx(cfg);
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_EQ(SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION), 1);
+    TLSSocket server(cfg);
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+    std::jthread worker([&] { EXPECT_FALSE(server.accept_until(deadline_after(2s))); });
+    TLSSocket client(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = 19408, .connect_timeout = 1s},
+        .ca_file = cert.cert_file, .min_version = ETlsMinVersion::TLS_1_3});
+    EXPECT_FALSE(client.connect());
+    EXPECT_FALSE(client.valid());
+}
+
+TEST_F(TLSSocketTest, MissingOrMismatchedAlpnIsReportedAsEmpty) {
+    for (int scenario = 0; scenario < 2; ++scenario) {
+        SelfSignedCert cert;
+        auto port = static_cast<u16>(19409 + scenario);
+        TlsServerConfig cfg{.tcp = {.host = "127.0.0.1", .port = port, .reuse_addr = true},
+            .cert_file = cert.cert_file, .key_file = cert.key_file, .min_version = ETlsMinVersion::TLS_1_3};
+        if (scenario == 1) cfg.alpn_protocols = {"different/1"};
+        TLSSocket server(cfg);
+        ASSERT_TRUE(server.bind());
+        ASSERT_TRUE(server.listen());
+        std::jthread worker([&] {
+            auto peer = server.accept_until(deadline_after(2s));
+            ASSERT_TRUE(peer);
+            EXPECT_TRUE(peer.value().negotiated_protocol().empty());
+        });
+        TLSSocket client(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = port, .connect_timeout = 1s},
+            .ca_file = cert.cert_file, .alpn_protocols = {"svc/3"}, .min_version = ETlsMinVersion::TLS_1_3});
+        ASSERT_TRUE(client.connect()) << client.handshake_error();
+        EXPECT_TRUE(client.negotiated_protocol().empty());
+        client.close();
+    }
+}
+
+TEST_F(TLSSocketTest, BackpressuredWriteUsesOneDeadline) {
+    SelfSignedCert cert;
+    TLSSocket server(TlsServerConfig{.tcp = {.host = "127.0.0.1", .port = 19403, .reuse_addr = true},
+        .cert_file = cert.cert_file, .key_file = cert.key_file});
+    ASSERT_TRUE(server.bind());
+    ASSERT_TRUE(server.listen());
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::jthread worker([&] {
+        auto peer = server.accept_until(deadline_after(2s));
+        if (peer) released.wait_for(2s); // deliberately do not drain application bytes
+    });
+    TLSSocket client(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = 19403, .connect_timeout = 1s}, .ca_file = cert.cert_file});
+    ASSERT_TRUE(client.connect()) << client.handshake_error();
+    auto start = std::chrono::steady_clock::now();
+    std::vector<std::byte> data(100000);
+    auto deadline = start + 200ms;
+    bool failed = false;
+    for (int i = 0; i < 10000; ++i) {
+        auto result = client.send_until(data, deadline);
+        if (!result) { failed = true; break; }
+        EXPECT_LE(result.value(), 65536u);
+    }
+    release.set_value();
+    EXPECT_TRUE(failed);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 800ms);
+    EXPECT_FALSE(client.valid());
+}
+
+TEST_F(TLSSocketTest, SetupRejectsInvalidTrustKeysAlpnAndHandles) {
+    TlsClientConfig cfg;
+    cfg.ca_file = "missing-ca.pem";
+    EXPECT_EQ(internal::acquire_ctx(cfg), nullptr);
+    cfg.ca_file.clear();
+    cfg.verify_peer = false;
+    cfg.verify_hostname = false;
+    cfg.client_cert_file = "missing-client.pem";
+    EXPECT_EQ(internal::acquire_ctx(cfg), nullptr);
+    cfg.client_key_file = "missing-key.pem";
+    EXPECT_EQ(internal::acquire_ctx(cfg), nullptr);
+    cfg.client_cert_file.clear();
+    cfg.client_key_file.clear();
+    cfg.alpn_protocols = {""};
+    EXPECT_EQ(internal::acquire_ctx(cfg), nullptr);
+    cfg.alpn_protocols = {std::string(256, 'a')};
+    EXPECT_EQ(internal::acquire_ctx(cfg), nullptr);
+    cfg.alpn_protocols.clear();
+    SSL_CTX* ctx = internal::acquire_ctx(cfg);
+    ASSERT_NE(ctx, nullptr);
+    SSL* ssl = SSL_new(ctx);
+    ASSERT_NE(ssl, nullptr);
+    EXPECT_FALSE(internal::attach_socket(ssl, INVALID_SOCKET_HANDLE));
+#ifdef _WIN32
+    EXPECT_FALSE(internal::attach_socket(ssl, SocketHandle{1} << 40));
+#endif
+    SSL_free(ssl);
+}
+
+TEST_F(TLSSocketTest, IpIdentityOmitsSniAndDnsIdentityPreservesIt) {
+    TlsClientConfig cfg;
+    cfg.verify_peer = false;
+    cfg.verify_hostname = false;
+    cfg.tcp.host = "127.0.0.1";
+    SSL_CTX* ctx = internal::acquire_ctx(cfg);
+    ASSERT_NE(ctx, nullptr);
+    TCPSocket tcp(cfg.tcp);
+    SSL* ssl = SSL_new(ctx);
+    ASSERT_NE(ssl, nullptr);
+    EXPECT_TRUE(internal::setup_client_ssl(ssl, cfg, tcp.native_handle()));
+    EXPECT_EQ(SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name), nullptr);
+    SSL_free(ssl);
+    ssl = SSL_new(ctx);
+    ASSERT_NE(ssl, nullptr);
+    cfg.sni_hostname = "localhost";
+    EXPECT_TRUE(internal::setup_client_ssl(ssl, cfg, tcp.native_handle()));
+    EXPECT_STREQ(SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name), "localhost");
+    SSL_free(ssl);
+}
+
+TEST_F(TLSSocketTest, VerifiedTls13RejectsExpiredAndWrongIpCertificates) {
+    for (int scenario = 0; scenario < 2; ++scenario) {
+        SelfSignedCert cert(scenario == 0, scenario == 0 ? "DNS:localhost,IP:127.0.0.1" : "DNS:localhost,IP:127.0.0.2");
+        auto port = static_cast<u16>(19404 + scenario);
+        TLSSocket server(TlsServerConfig{.tcp = {.host = "127.0.0.1", .port = port, .reuse_addr = true},
+            .cert_file = cert.cert_file, .key_file = cert.key_file, .min_version = ETlsMinVersion::TLS_1_3});
+        ASSERT_TRUE(server.bind());
+        ASSERT_TRUE(server.listen());
+        std::jthread worker([&] { EXPECT_FALSE(server.accept_until(deadline_after(2s))); });
+        TLSSocket client(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = port, .connect_timeout = 1s},
+            .ca_file = cert.cert_file, .min_version = ETlsMinVersion::TLS_1_3});
+        EXPECT_FALSE(client.connect());
+        EXPECT_FALSE(client.valid());
+        EXPECT_NE(client.handshake_error().find("verify"), std::string::npos);
+    }
+}
 
 TEST_F(TLSSocketTest, ClientConstructionProducesValidTcp) {
     TLSSocket sock(TlsClientConfig{.tcp = {.host = "127.0.0.1", .port = TLS_PORT_BIND}});
@@ -939,7 +1257,8 @@ TEST_F(TLSSocketTest, ServerRequiringClientCertAcceptsValidCert) {
                                      .cert_file           = server_leaf.cert_file,
                                      .key_file            = server_leaf.key_file,
                                      .ca_file             = ca.ca_cert_file,
-                                     .require_client_cert = true});
+                                     .require_client_cert = true,
+                                     .min_version = ETlsMinVersion::TLS_1_3});
     ASSERT_TRUE(server.bind());
     ASSERT_TRUE(server.listen());
 
@@ -960,8 +1279,10 @@ TEST_F(TLSSocketTest, ServerRequiringClientCertAcceptsValidCert) {
                                      .verify_peer      = false,
                                      .verify_hostname  = false,
                                      .client_cert_file = client_leaf.cert_file,
-                                     .client_key_file  = client_leaf.key_file});
+                                     .client_key_file  = client_leaf.key_file,
+                                     .min_version = ETlsMinVersion::TLS_1_3});
     ASSERT_TRUE(client.connect()) << client.handshake_error();
+    EXPECT_EQ(client.negotiated_tls_version(), "TLSv1.3");
 
     const std::string payload = "mtls-ok";
     std::vector<std::byte> sbuf(payload.size());

@@ -13,25 +13,28 @@ namespace sap::network {
     using internal::error_message;
     using internal::last_error;
     using internal::set_nonblocking;
-    using internal::wait_writable;
     using internal::would_block;
 
     namespace {
 
         bool connect_blocking(SocketHandle h, const sockaddr* addr, socklen_t len) { return ::connect(h, addr, len) == 0; }
 
-        bool connect_with_timeout(SocketHandle h, const sockaddr* addr, socklen_t len, std::chrono::milliseconds timeout) {
-            set_nonblocking(h, true);
+        bool connect_with_deadline(SocketHandle h, const sockaddr* addr, socklen_t len, Deadline deadline) {
+            if (internal::expired(deadline) || !set_nonblocking(h, true))
+                return false;
             bool connected = (::connect(h, addr, len) == 0);
             if (!connected && would_block(last_error()))
-                connected = wait_writable(h, static_cast<long>(timeout.count()));
-            set_nonblocking(h, false);
-            return connected;
+                connected = internal::connect_ready(h, deadline);
+            return set_nonblocking(h, false) && connected && !internal::expired(deadline);
         }
 
     } // namespace
 
-    TCPSocket::TCPSocket(SocketConfig config) : m_handle(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), m_config(std::move(config)) {}
+    TCPSocket::TCPSocket(SocketConfig config) : m_handle(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)), m_config(std::move(config)) {
+        if (valid() && (m_config.connect_timeout.count() < 0 || !apply_recv_timeout(m_handle, m_config.recv_timeout) ||
+                        !apply_send_timeout(m_handle, m_config.send_timeout)))
+            close();
+    }
 
     TCPSocket::TCPSocket(SocketHandle handle) : m_handle(handle) {}
 
@@ -83,6 +86,27 @@ namespace sap::network {
     bool TCPSocket::listen() { return ::listen(m_handle, m_config.listen_backlog) == 0; }
 
     bool TCPSocket::connect() {
+        if (m_config.connect_timeout.count() < 0)
+            return false;
+        return connect_until(deadline_after(m_config.connect_timeout));
+    }
+
+    bool TCPSocket::connect_until(Deadline deadline) {
+        if (!valid() || internal::expired(deadline) || m_config.host.empty() || m_config.host.find('\0') != stl::string::npos)
+            return false;
+        // A finite operation never enters the synchronous resolver. Supply a
+        // numeric endpoint and use TlsClientConfig::sni_hostname for DNS identity.
+        if (deadline != (Deadline::max)()) {
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(m_config.port);
+            if (::inet_pton(AF_INET, m_config.host.c_str(), &address.sin_addr) != 1)
+                return false;
+            bool ok = connect_with_deadline(m_handle, reinterpret_cast<sockaddr*>(&address), sizeof(address), deadline);
+            if (!ok)
+                close();
+            return ok;
+        }
         std::string port_str = std::to_string(m_config.port);
         addrinfo hints{};
         hints.ai_family = AF_INET;
@@ -90,25 +114,53 @@ namespace sap::network {
         addrinfo* res = nullptr;
         if (::getaddrinfo(m_config.host.c_str(), port_str.c_str(), &hints, &res) != 0)
             return false;
-        bool ok = m_config.connect_timeout.count() > 0
-            ? connect_with_timeout(m_handle, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen), m_config.connect_timeout)
-            : connect_blocking(m_handle, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen));
+        bool ok = false;
+        unsigned attempts = 0;
+        for (auto* entry = res; entry && attempts < 16; entry = entry->ai_next, ++attempts) {
+            if (attempts != 0) {
+                close();
+                m_handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (!valid() || !apply_recv_timeout(m_handle, m_config.recv_timeout) ||
+                    !apply_send_timeout(m_handle, m_config.send_timeout))
+                    break;
+            }
+            if (connect_blocking(m_handle, entry->ai_addr, static_cast<socklen_t>(entry->ai_addrlen))) {
+                ok = true;
+                break;
+            }
+        }
         ::freeaddrinfo(res);
+        if (!ok)
+            close();
         return ok;
     }
 
-    stl::result<TCPSocket> TCPSocket::accept() {
+    stl::result<TCPSocket> TCPSocket::accept() { return accept_until((Deadline::max)()); }
+
+    stl::result<TCPSocket> TCPSocket::accept_until(Deadline deadline) {
+        if (!valid() || internal::expired(deadline) || !set_nonblocking(m_handle, true))
+            return stl::make_error<TCPSocket>("Invalid listener or expired accept deadline");
         sockaddr_in addr{};
         socklen_t len = sizeof(addr);
-        SocketHandle client = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
+        SocketHandle client;
+        for (;;) {
+            client = ::accept(m_handle, reinterpret_cast<sockaddr*>(&addr), &len);
+            if (client != INVALID_SOCKET_HANDLE || !would_block(last_error()) || !internal::wait_ready(m_handle, false, deadline))
+                break;
+        }
+        bool restored = set_nonblocking(m_handle, false);
+        if (!restored || internal::expired(deadline)) {
+            if (client != INVALID_SOCKET_HANDLE)
+                close_handle(client);
+            return stl::make_error<TCPSocket>("Accept deadline or socket setup failed");
+        }
         if (client == INVALID_SOCKET_HANDLE)
             return stl::make_error<TCPSocket>("Failed to accept TCP socket: {}", error_message(last_error()));
         TCPSocket sock{client};
         sock.m_config = m_config;
-        if (m_config.recv_timeout.count() > 0)
-            sock.set_recv_timeout(m_config.recv_timeout);
-        if (m_config.send_timeout.count() > 0)
-            sock.set_send_timeout(m_config.send_timeout);
+        if (!set_nonblocking(client, false) || !apply_recv_timeout(client, m_config.recv_timeout) ||
+            !apply_send_timeout(client, m_config.send_timeout))
+            return stl::make_error<TCPSocket>("Accepted socket setup failed");
         return sock;
     }
 
@@ -138,7 +190,19 @@ namespace sap::network {
 
     bool TCPSocket::valid() const { return m_handle != INVALID_SOCKET_HANDLE; }
 
-    void TCPSocket::set_recv_timeout(std::chrono::milliseconds ms) { apply_recv_timeout(m_handle, ms); }
-    void TCPSocket::set_send_timeout(std::chrono::milliseconds ms) { apply_send_timeout(m_handle, ms); }
+    void TCPSocket::set_recv_timeout(std::chrono::milliseconds ms) {
+        if (!apply_recv_timeout(m_handle, ms)) {
+            close();
+            return;
+        }
+        m_config.recv_timeout = ms;
+    }
+    void TCPSocket::set_send_timeout(std::chrono::milliseconds ms) {
+        if (!apply_send_timeout(m_handle, ms)) {
+            close();
+            return;
+        }
+        m_config.send_timeout = ms;
+    }
 
 } // namespace sap::network

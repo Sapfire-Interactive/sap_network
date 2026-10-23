@@ -7,6 +7,7 @@ project(sap_network VERSION 0.1)
 find_package(OpenSSL 3.0 REQUIRED)
 
 option(SAP_NETWORK_BUILD_TESTS "Build sap_network tests" On)
+option(SAP_TLS_WIRE_LOGGING "Enable explicit plaintext TLS logging callbacks" OFF)
 
 if(NOT TARGET sap::core)
     add_subdirectory(sap_core)
@@ -42,7 +43,7 @@ endif()
 
 target_compile_definitions(sap_network_lib
     PUBLIC
-        $<$<OR:$<CONFIG:Debug>,$<BOOL:${SAP_TLS_WIRE_LOGGING}>>:SAP_TLS_WIRE_LOGGING>
+        $<$<BOOL:${SAP_TLS_WIRE_LOGGING}>:SAP_TLS_WIRE_LOGGING>
 )
 
 target_link_libraries(sap_network_lib

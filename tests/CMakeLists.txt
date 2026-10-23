@@ -32,4 +32,4 @@ target_include_directories(sap_network_tests
 )
 
 include(GoogleTest)
-gtest_discover_tests(sap_network_tests)
+gtest_discover_tests(sap_network_tests PROPERTIES TIMEOUT 30)

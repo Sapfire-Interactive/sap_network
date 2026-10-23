@@ -55,6 +55,13 @@ The config variant is declared before the `TCPSocket` member — member initiali
 
 Post-handshake you can query `negotiated_protocol()` (ALPN result), `negotiated_cipher()`, `negotiated_tls_version()`, `peer_cert_subject()`, and `peer_cert_issuer()`.
 
+Synchronous TLS now offers `connect_until`, `accept_until`, `send_until` and
+`recv_until` with absolute steady-clock deadlines. Finite connects require a
+numeric IPv4 endpoint; use `sni_hostname` for a separate DNS certificate identity.
+Read the [bounded TLS contract](docs/bounded_tls.md) for timeout behavior,
+compatibility changes, verification, and concurrency limits. Plaintext logging is
+off by default in every build configuration.
+
 ## Build
 
 Requires CMake 3.20+, C++20, OpenSSL, and [sap_core](https://github.com/Sapfire-Interactive/sap_core).
@@ -86,7 +93,7 @@ else
 #include <sap_network/tls_socket.h>
 
 // TLS client
-sap::network::TLSSocket tls{TlsClientConfig{.host = "example.com", .port = 443}};
+sap::network::TLSSocket tls{sap::network::TlsClientConfig{.tcp = {.host = "example.com", .port = 443}}};
 if (!tls.connect()) {
     std::println("handshake failed: {}", tls.handshake_error());
     return;

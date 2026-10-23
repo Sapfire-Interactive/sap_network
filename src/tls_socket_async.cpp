@@ -168,7 +168,11 @@ namespace sap::network {
             m_handshake_error = "SSL_new failed: " + drain_ssl_errors();
             co_return stl::make_error<>("{}", m_handshake_error);
         }
-        setup_client_ssl(m_ssl, *cfg, m_handle);
+        if (!setup_client_ssl(m_ssl, *cfg, m_handle)) {
+            m_handshake_error = "TLS setup failed: " + drain_ssl_errors();
+            close();
+            co_return stl::make_error<>("{}", m_handshake_error);
+        }
 
         for (;;) {
             int rc = ::SSL_connect(m_ssl);
@@ -226,7 +230,11 @@ namespace sap::network {
             close_handle(child_fd);
             co_return stl::make_error<TLSSocketAsync>("SSL_new failed: {}", drain_ssl_errors());
         }
-        ::SSL_set_fd(child_ssl, static_cast<int>(child_fd));
+        if (!internal::attach_socket(child_ssl, child_fd)) {
+            ::SSL_free(child_ssl);
+            close_handle(child_fd);
+            co_return stl::make_error<TLSSocketAsync>("TLS socket attachment failed");
+        }
 
         for (;;) {
             int rc = ::SSL_accept(child_ssl);

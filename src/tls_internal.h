@@ -29,11 +29,12 @@ namespace sap::network::internal {
 
     // Wires fd, SNI, ALPN, and hostname verification on a freshly-created
     // client SSL*. Caller still drives SSL_connect.
-    void setup_client_ssl(SSL* ssl, const TlsClientConfig& cfg, SocketHandle fd);
+    bool setup_client_ssl(SSL* ssl, const TlsClientConfig& cfg, SocketHandle fd);
+    // Reject unrepresentable native handles instead of silently truncating them.
+    bool attach_socket(SSL* ssl, SocketHandle fd);
 
     // Pulls verify result + error stack into a human-readable message for
     // failed SSL_connect / SSL_accept calls.
     stl::string format_handshake_error(const char* stage, SSL* ssl);
 
 } // namespace sap::network::internal
-

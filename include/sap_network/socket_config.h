@@ -13,7 +13,9 @@ namespace sap::network {
     struct SocketConfig {
         stl::string host;
         u16 port = 0;
-        std::chrono::milliseconds connect_timeout = std::chrono::milliseconds{0}; // 0 = no timeout (blocking)
+        // Finite synchronous connects require a numeric IPv4 host. TLS can use
+        // a separate sni_hostname for DNS certificate identity. 0 = unbounded DNS/connect.
+        std::chrono::milliseconds connect_timeout = std::chrono::milliseconds{0};
         std::chrono::milliseconds recv_timeout = std::chrono::milliseconds{0}; // 0 = no timeout
         std::chrono::milliseconds send_timeout = std::chrono::milliseconds{0}; // 0 = no timeout
         i32 listen_backlog = 128;
@@ -27,7 +29,7 @@ namespace sap::network {
 #ifdef SAP_TLS_WIRE_LOGGING
     enum class ETlsWireDirection { Send, Recv };
     // Debug hook signature, compiled in only when SAP_TLS_WIRE_LOGGING is
-    // defined (auto-enabled in Debug builds). Called once per successful
+    // explicitly enabled in CMake (off by default in every build). Called once per successful
     // send / recv with the decrypted plaintext.
     using TlsWireLogFn = std::function<void(ETlsWireDirection, stl::span<const std::byte>)>;
 #endif
